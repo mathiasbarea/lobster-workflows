@@ -1,0 +1,15 @@
+{
+  "name": "lobster-workflows",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "commonjs",
+  "scripts": {
+    "bootstrap-workspace": "node scripts/bootstrap-workspace.js",
+    "new-workflow": "node scripts/new-workflow.js",
+    "run-workflow": "node scripts/run-workflow.js",
+    "sync-schedules": "node scripts/sync-schedules.js",
+    "rebuild-daily-summary": "node scripts/rebuild-daily-summary.js",
+    "test": "node --test tests/*.test.js"
+  }
+}

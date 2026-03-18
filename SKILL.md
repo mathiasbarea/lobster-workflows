@@ -1,0 +1,94 @@
+---
+name: lobster-workflows
+description: Create and manage Lobster-based workflow workspaces, shared workflow libraries, workflow scaffolds, OpenClaw cron schedule sync, and execution metrics under workspace/workflows. Use when a user wants to bootstrap a workflows platform, create a new workflow, standardize workflow structure, or manage workflow scheduling and observability.
+---
+
+# Lobster Workflows
+
+Use this skill when working on a workspace-level `workflows/` platform backed by Lobster and OpenClaw cron.
+
+## What This Skill Owns
+
+- Bootstrap `workflows/`, `workflows/_shared`, and `workflows/_executions`
+- Scaffold new workflows with `workflow.config.js`, runner, Lobster file, and tests
+- Provide platform scripts for schedule sync, managed execution, and execution summaries
+
+## Authoring Protocol
+
+When the user asks to create a new workflow, follow this order:
+
+1. Ensure the workspace platform exists
+2. Gather the minimum workflow spec
+3. Scaffold the workflow
+4. Implement the workflow logic and tests
+5. Add schedules only if the user asked for them or the spec clearly requires them
+6. Sync schedules after the workflow config is ready
+7. Validate the workflow with tests or a safe smoke run
+
+Do not skip the spec-gathering step unless the missing details are low-risk and you can make a defensible default assumption.
+
+## Minimum Workflow Spec
+
+Before creating a new workflow, make sure you know:
+
+- stable `workflowId`
+- workflow goal
+- workflow phases or steps
+- expected final result
+- whether it needs a schedule
+- if scheduled: schedule frequency, timezone, and whether it should count toward expected runs
+- workflow inputs or default runtime values
+- side effects or external systems touched
+- what success means
+
+If any of those are missing and they materially affect implementation, ask concise follow-up questions.
+
+Read `references/new-workflow-requirements.md` when authoring a workflow from a user request.
+
+## Commands
+
+Use the bundled scripts directly:
+
+```bash
+node scripts/bootstrap-workspace.js --workspace-root <path>
+node scripts/new-workflow.js --workspace-root <path> --id <workflow-id>
+node scripts/run-workflow.js --workspace-root <path> --workflow <workflow-id>
+node scripts/sync-schedules.js --workspace-root <path> [--workflow <workflow-id>]
+node scripts/rebuild-daily-summary.js --workspace-root <path> --date YYYY-MM-DD
+```
+
+## Rules
+
+- `workflows/_shared` is only for reusable helpers imported by workflows
+- Global workflow platform logic belongs in this skill, not in `workflows/_shared`
+- Runtime state belongs in `workflows/_executions`
+- Do not initialize git inside `workflows/`; only the skill folder itself may own its own git repo
+- Use `node scripts/new-workflow.js` for the initial scaffold instead of hand-creating the base structure
+- Put workflow tests in `workflows/<workflow-id>/tests/`
+- Keep `workflow.config.js` declarative
+- The workflow defines identity, runtime, schedules, result, and observability
+- The skill runtime writes run records and latest results; the workflow does not write `_executions` directly
+
+## Workflow Creation Checklist
+
+When building a real workflow after scaffolding:
+
+- replace the placeholder action with the requested phases
+- update `workflow.config.js` so `runtime.defaultAction` and `result.extractor` match the real workflow
+- write or adapt `README.md` and `CONTRACT.md`
+- add at least one smoke test plus targeted tests for fragile phases
+- prefer `_shared` helpers only when they are genuinely workflow-agnostic
+- keep platform logic out of the workflow folder
+
+Read `references/testing-rules.md` when adding or reviewing tests.
+Read `references/shared-modules-catalog.md` before adding new helpers to `_shared`.
+Read `references/schedule-and-result-rules.md` when defining schedules or the canonical workflow result.
+
+## References
+
+- Read `references/platform-architecture.md` when changing the workspace layout or responsibilities
+- Read `references/workflow-config.md` when changing scaffolded `workflow.config.js`
+- Read `references/new-workflow-requirements.md` when turning a user request into a workflow spec
+- Read `references/shared-modules-catalog.md` when deciding whether code belongs in `_shared`
+- Read `references/testing-rules.md` when deciding what tests a workflow must have
+- Read `references/schedule-and-result-rules.md` when defining schedules, expected runs, or canonical result payloads
