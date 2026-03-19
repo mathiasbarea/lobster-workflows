@@ -56,7 +56,7 @@ node scripts/new-workflow.js --workspace-root <path> --id <workflow-id>
 node scripts/run-workflow.js --workspace-root <path> --workflow <workflow-id>
 node scripts/list-pending-approvals.js --workspace-root <path>
 node scripts/resume-workflow.js --workspace-root <path> --callback-data '/lwf ap:<token>'
-node scripts/sync-schedules.js --workspace-root <path> [--workflow <workflow-id>]
+node scripts/sync-schedules.js --workspace-root <path> [--workflow <workflow-id>] [--sync-backend auto|cli|gateway] [--dry-run]
 node scripts/doctor.js --workspace-root <path> [--workflow <workflow-id>] [--fix]
 node scripts/rebuild-daily-summary.js --workspace-root <path> --date YYYY-MM-DD
 ```
@@ -84,6 +84,9 @@ node scripts/rebuild-daily-summary.js --workspace-root <path> --date YYYY-MM-DD
 - The workflow defines identity, runtime, schedules, result, and observability
 - The skill runtime writes run records and latest results; the workflow does not write `_executions` directly
 - Any task that creates, edits, enables, disables, or deletes a schedule in `workflow.config.js` must run `node scripts/sync-schedules.js --workspace-root <path> [--workflow <workflow-id>]` before completion
+- Prefer the default `--sync-backend auto`; it retries through the gateway if the CLI transport fails
+- Use `--dry-run` when you need a deterministic reconciliation plan and actionable remediation commands without mutating cron state
+- If schedule sync returns `status: "recovery-only"`, no cron mutation happened; use `recovery.retryCommands` or `operations[].remediation` instead of claiming the sync succeeded
 - If schedule drift is suspected or the user asks for a health check, run `node scripts/doctor.js --workspace-root <path>` and use `--fix` when the user wants reconciliation applied automatically
 
 ## Workflow Creation Checklist

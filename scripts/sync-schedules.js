@@ -9,6 +9,8 @@ function syncSchedules({
   workspaceRoot,
   workflowId = null,
   skillRoot = path.resolve(__dirname, '..'),
+  syncBackend = 'auto',
+  dryRun = false,
   openclawCommand = 'openclaw',
   openclawTimeoutMs = 30000,
   openclawRetryCount,
@@ -22,6 +24,8 @@ function syncSchedules({
     workspaceRoot,
     workflow,
     skillRoot,
+    syncBackend,
+    dryRun,
     openclawCommand,
     openclawTimeoutMs,
     openclawRetryCount,
@@ -45,12 +49,17 @@ function main(argv = process.argv.slice(2)) {
     workspaceRoot,
     workflowId: flags.workflow || null,
     skillRoot: path.resolve(flags.skillRoot || path.resolve(__dirname, '..')),
+    syncBackend: flags.syncBackend || 'auto',
+    dryRun: Boolean(flags.dryRun),
     openclawCommand: flags.openclawCommand || 'openclaw',
     openclawTimeoutMs: flags.openclawTimeoutMs ? Number.parseInt(flags.openclawTimeoutMs, 10) : 30000,
     openclawRetryCount: flags.openclawRetryCount ? Number.parseInt(flags.openclawRetryCount, 10) : undefined,
     openclawRetryDelayMs: flags.openclawRetryDelayMs ? Number.parseInt(flags.openclawRetryDelayMs, 10) : undefined,
   });
   printJson(result);
+  if (result.workflows.some((workflow) => workflow?.recoveryOnly === true)) {
+    process.exitCode = 2;
+  }
 }
 
 if (require.main === module) {

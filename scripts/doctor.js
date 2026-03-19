@@ -326,9 +326,17 @@ function applyScheduleSyncFixes({
         openclawTimeoutMs,
         runCommandFn: run,
       });
+      const workflowResult = result.workflows?.[0] || null;
+      if (workflowResult?.recoveryOnly) {
+        errors.push({
+          workflowId,
+          error: workflowResult.error || workflowResult.recovery?.summary || 'Schedule sync returned recovery-only guidance.',
+        });
+        continue;
+      }
       applied.push({
         workflowId,
-        operations: result.workflows?.[0]?.operations || [],
+        operations: workflowResult?.operations || [],
       });
     } catch (error) {
       errors.push({

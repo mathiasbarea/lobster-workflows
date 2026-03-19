@@ -3,16 +3,22 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const { normalizePath } = require('../_lib');
+const { parseJsonFromMixedStdout } = require('./approval-utils');
 const {
   collectGatewayAccessDiagnostics,
   summarizeGatewayAccessDiagnostics,
 } = require('./openclaw-health');
 const { runCommand } = require('./process-utils');
-const { writeSyncState } = require('./execution-store');
+const {
+  readSyncState,
+  writeSyncState,
+} = require('./execution-store');
 
 const MANAGED_PREFIX = 'lobster-workflows::';
+const DEFAULT_SYNC_BACKEND = 'auto';
 const DEFAULT_OPENCLAW_RETRY_COUNT = 2;
 const DEFAULT_OPENCLAW_RETRY_DELAY_MS = 750;
+const SYNC_BACKENDS = new Set(['auto', 'cli', 'gateway']);
 let cachedOpenclawCliScriptPath = null;
 
 function getManagedJobName(workflowId, scheduleId) {
@@ -26,9 +32,14 @@ function parseCronListJson(stdout) {
   return [];
 }
 
+function extractCronJobId(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  return parsed.jobId || parsed.id || parsed?.job?.jobId || parsed?.job?.id || parsed?.result?.jobId || parsed?.result?.id || null;
+}
+
 function parseCronAddJson(stdout) {
   const parsed = stdout && stdout.trim() ? JSON.parse(stdout) : {};
-  return parsed.jobId || parsed.id || parsed?.job?.jobId || parsed?.job?.id || parsed?.result?.jobId || parsed?.result?.id || null;
+  return extractCronJobId(parsed);
 }
 
 function parseDurationMs(input) {
@@ -45,6 +56,21 @@ function parseDurationMs(input) {
         : unit === 'h' ? 60 * 60 * 1000
           : 24 * 60 * 60 * 1000;
   return Math.floor(quantity * factor);
+}
+
+function normalizeSyncBackend(syncBackend = DEFAULT_SYNC_BACKEND) {
+  const normalized = String(syncBackend || DEFAULT_SYNC_BACKEND).trim().toLowerCase();
+  if (!SYNC_BACKENDS.has(normalized)) {
+    throw new Error(`Unsupported sync backend: ${syncBackend}`);
+  }
+  return normalized;
+}
+
+function parseOpenclawJson(stdout) {
+  const parsed = parseJsonFromMixedStdout(stdout);
+  if (parsed != null) return parsed;
+  const text = String(stdout || '').trim();
+  return text ? JSON.parse(text) : {};
 }
 
 function sleepSync(ms) {
@@ -185,6 +211,94 @@ function appendScheduleArgs(args, schedule) {
   throw new Error(`Unsupported schedule kind for sync: ${schedule.kind}`);
 }
 
+function buildGatewaySchedule(schedule) {
+  if (schedule.kind === 'cron') {
+    const gatewaySchedule = {
+      kind: 'cron',
+      expr: schedule.cron,
+    };
+    if (schedule.timezone) gatewaySchedule.tz = schedule.timezone;
+    if (schedule.exact) gatewaySchedule.staggerMs = 0;
+    else if (schedule.stagger) gatewaySchedule.staggerMs = parseDurationMs(schedule.stagger);
+    return gatewaySchedule;
+  }
+
+  if (schedule.kind === 'every') {
+    return {
+      kind: 'every',
+      everyMs: parseDurationMs(schedule.every),
+    };
+  }
+
+  if (schedule.kind === 'at') {
+    const parsedAtMs = Date.parse(String(schedule.at || '').trim());
+    return {
+      kind: 'at',
+      at: Number.isNaN(parsedAtMs) ? String(schedule.at || '').trim() : new Date(parsedAtMs).toISOString(),
+    };
+  }
+
+  throw new Error(`Unsupported schedule kind for sync: ${schedule.kind}`);
+}
+
+function buildGatewayJobCreate({ workflow, schedule, skillRoot, workspaceRoot }) {
+  const timeoutSeconds = Math.max(1, Math.ceil((workflow.config.observability?.defaultTimeoutMs || 30000) / 1000));
+  const jobCreate = {
+    name: getManagedJobName(workflow.workflowId, schedule.scheduleId),
+    description: schedule.description || `${workflow.workflowId}:${schedule.scheduleId}`,
+    enabled: true,
+    sessionTarget: 'isolated',
+    wakeMode: 'now',
+    payload: {
+      kind: 'agentTurn',
+      message: buildCronMessage({
+        skillRoot,
+        workspaceRoot,
+        workflowId: workflow.workflowId,
+        scheduleId: schedule.scheduleId,
+      }),
+      timeoutSeconds,
+      lightContext: true,
+    },
+    delivery: {
+      mode: 'none',
+    },
+    schedule: buildGatewaySchedule(schedule),
+  };
+
+  if (schedule.kind === 'at') {
+    jobCreate.deleteAfterRun = schedule.deleteAfterRun !== false;
+  }
+
+  return jobCreate;
+}
+
+function buildGatewayJobPatch({ workflow, schedule, skillRoot, workspaceRoot }) {
+  const jobCreate = buildGatewayJobCreate({
+    workflow,
+    schedule,
+    skillRoot,
+    workspaceRoot,
+  });
+
+  const patch = {
+    name: jobCreate.name,
+    description: jobCreate.description,
+    enabled: jobCreate.enabled,
+    sessionTarget: jobCreate.sessionTarget,
+    wakeMode: jobCreate.wakeMode,
+    payload: jobCreate.payload,
+    delivery: jobCreate.delivery,
+    schedule: jobCreate.schedule,
+  };
+
+  if (Object.prototype.hasOwnProperty.call(jobCreate, 'deleteAfterRun')) {
+    patch.deleteAfterRun = jobCreate.deleteAfterRun;
+  }
+
+  return patch;
+}
+
 function resolveOpenclawCliScriptPath(openclawCommand) {
   if (cachedOpenclawCliScriptPath) return cachedOpenclawCliScriptPath;
 
@@ -290,14 +404,50 @@ function runOpenclawCommand({
   };
 }
 
-function listCronJobs({
+function buildGatewayCallArgs(method, params, openclawTimeoutMs) {
+  return [
+    'gateway',
+    'call',
+    method,
+    '--json',
+    '--params',
+    JSON.stringify(params || {}),
+    '--timeout',
+    String(Math.max(10000, openclawTimeoutMs)),
+  ];
+}
+
+function runGatewayMethod({
+  method,
+  params,
+  openclawCommand,
+  workspaceRoot,
+  openclawTimeoutMs,
+  runCommandFn,
+  openclawRetryCount = DEFAULT_OPENCLAW_RETRY_COUNT,
+  openclawRetryDelayMs = DEFAULT_OPENCLAW_RETRY_DELAY_MS,
+  sleepFn = sleepSync,
+}) {
+  return runOpenclawCommand({
+    openclawCommand,
+    args: buildGatewayCallArgs(method, params, openclawTimeoutMs),
+    workspaceRoot,
+    openclawTimeoutMs,
+    runCommandFn,
+    openclawRetryCount,
+    openclawRetryDelayMs,
+    sleepFn,
+  });
+}
+
+function listCronJobsViaCli({
   workspaceRoot,
   openclawCommand = 'openclaw',
   openclawTimeoutMs = 30000,
-  openclawRetryCount = DEFAULT_OPENCLAW_RETRY_COUNT,
-  openclawRetryDelayMs = DEFAULT_OPENCLAW_RETRY_DELAY_MS,
   includeDisabled = true,
   runCommandFn = runCommand,
+  openclawRetryCount = DEFAULT_OPENCLAW_RETRY_COUNT,
+  openclawRetryDelayMs = DEFAULT_OPENCLAW_RETRY_DELAY_MS,
   sleepFn = sleepSync,
 }) {
   const args = ['cron', 'list'];
@@ -316,7 +466,7 @@ function listCronJobs({
   });
   if (!listResult.ok) {
     throw new Error(buildOpenclawFailureMessage({
-      prefix: 'Failed to list cron jobs',
+      prefix: 'Failed to list cron jobs via cli backend',
       result: listResult,
       workspaceRoot,
       openclawCommand,
@@ -326,6 +476,762 @@ function listCronJobs({
   }
 
   return parseCronListJson(listResult.stdout);
+}
+
+function listCronJobsViaGateway({
+  workspaceRoot,
+  openclawCommand = 'openclaw',
+  openclawTimeoutMs = 30000,
+  includeDisabled = true,
+  runCommandFn = runCommand,
+  openclawRetryCount = DEFAULT_OPENCLAW_RETRY_COUNT,
+  openclawRetryDelayMs = DEFAULT_OPENCLAW_RETRY_DELAY_MS,
+  sleepFn = sleepSync,
+}) {
+  const jobs = [];
+  let offset = 0;
+  let hasMore = true;
+  while (hasMore) {
+    const listResult = runGatewayMethod({
+      method: 'cron.list',
+      params: {
+        includeDisabled,
+        offset,
+      },
+      openclawCommand,
+      workspaceRoot,
+      openclawTimeoutMs,
+      runCommandFn,
+      openclawRetryCount,
+      openclawRetryDelayMs,
+      sleepFn,
+    });
+    if (!listResult.ok) {
+      throw new Error(buildOpenclawFailureMessage({
+        prefix: 'Failed to list cron jobs via gateway backend',
+        result: listResult,
+        workspaceRoot,
+        openclawCommand,
+        openclawTimeoutMs,
+        runCommandFn,
+      }));
+    }
+
+    const parsed = parseOpenclawJson(listResult.stdout);
+    const pageJobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
+    jobs.push(...pageJobs);
+    hasMore = parsed?.hasMore === true;
+    offset = typeof parsed?.nextOffset === 'number' ? parsed.nextOffset : jobs.length;
+    if (!hasMore) break;
+  }
+
+  return jobs;
+}
+
+function listCronJobsResolved({
+  workspaceRoot,
+  openclawCommand = 'openclaw',
+  openclawTimeoutMs = 30000,
+  syncBackend = DEFAULT_SYNC_BACKEND,
+  includeDisabled = true,
+  runCommandFn = runCommand,
+  openclawRetryCount = DEFAULT_OPENCLAW_RETRY_COUNT,
+  openclawRetryDelayMs = DEFAULT_OPENCLAW_RETRY_DELAY_MS,
+  sleepFn = sleepSync,
+}) {
+  const normalizedBackend = normalizeSyncBackend(syncBackend);
+  if (normalizedBackend === 'cli') {
+    return {
+      jobs: listCronJobsViaCli({
+        workspaceRoot,
+        openclawCommand,
+        openclawTimeoutMs,
+        includeDisabled,
+        runCommandFn,
+        openclawRetryCount,
+        openclawRetryDelayMs,
+        sleepFn,
+      }),
+      selectedBackend: 'cli',
+      backendAttempts: [{ backend: 'cli', ok: true }],
+    };
+  }
+
+  if (normalizedBackend === 'gateway') {
+    return {
+      jobs: listCronJobsViaGateway({
+        workspaceRoot,
+        openclawCommand,
+        openclawTimeoutMs,
+        includeDisabled,
+        runCommandFn,
+        openclawRetryCount,
+        openclawRetryDelayMs,
+        sleepFn,
+      }),
+      selectedBackend: 'gateway',
+      backendAttempts: [{ backend: 'gateway', ok: true }],
+    };
+  }
+
+  try {
+    const jobs = listCronJobsViaCli({
+      workspaceRoot,
+      openclawCommand,
+      openclawTimeoutMs,
+      includeDisabled,
+      runCommandFn,
+      openclawRetryCount,
+      openclawRetryDelayMs,
+      sleepFn,
+    });
+    return {
+      jobs,
+      selectedBackend: 'cli',
+      backendAttempts: [{ backend: 'cli', ok: true }],
+    };
+  } catch (cliError) {
+    const attempts = [{
+      backend: 'cli',
+      ok: false,
+      error: cliError.message || String(cliError),
+    }];
+    try {
+      const jobs = listCronJobsViaGateway({
+        workspaceRoot,
+        openclawCommand,
+        openclawTimeoutMs,
+        includeDisabled,
+        runCommandFn,
+        openclawRetryCount,
+        openclawRetryDelayMs,
+        sleepFn,
+      });
+      attempts.push({ backend: 'gateway', ok: true });
+      return {
+        jobs,
+        selectedBackend: 'gateway',
+        backendAttempts: attempts,
+      };
+    } catch (gatewayError) {
+      attempts.push({
+        backend: 'gateway',
+        ok: false,
+        error: gatewayError.message || String(gatewayError),
+      });
+      const cliMessage = cliError.message || String(cliError);
+      const gatewayMessage = gatewayError.message || String(gatewayError);
+      const combined = new Error(`Failed to list cron jobs via auto backend. CLI error: ${cliMessage}. Gateway error: ${gatewayMessage}`);
+      combined.backendAttempts = attempts;
+      throw combined;
+    }
+  }
+}
+
+function listCronJobs({
+  workspaceRoot,
+  openclawCommand = 'openclaw',
+  openclawTimeoutMs = 30000,
+  syncBackend = DEFAULT_SYNC_BACKEND,
+  openclawRetryCount = DEFAULT_OPENCLAW_RETRY_COUNT,
+  openclawRetryDelayMs = DEFAULT_OPENCLAW_RETRY_DELAY_MS,
+  includeDisabled = true,
+  runCommandFn = runCommand,
+  sleepFn = sleepSync,
+}) {
+  return listCronJobsResolved({
+    workspaceRoot,
+    openclawCommand,
+    openclawTimeoutMs,
+    syncBackend,
+    openclawRetryCount,
+    openclawRetryDelayMs,
+    includeDisabled,
+    runCommandFn,
+    sleepFn,
+  }).jobs;
+}
+
+function buildOperationRemediation({
+  operation,
+  openclawCommand,
+  openclawTimeoutMs,
+}) {
+  return {
+    cli: {
+      command: openclawCommand,
+      args: operation.cliArgs,
+    },
+    gateway: {
+      command: openclawCommand,
+      args: buildGatewayCallArgs(operation.gatewayMethod, operation.gatewayParams, openclawTimeoutMs),
+      method: operation.gatewayMethod,
+      params: operation.gatewayParams,
+    },
+  };
+}
+
+function buildAddOperation({
+  workflow,
+  schedule,
+  skillRoot,
+  workspaceRoot,
+  openclawCommand,
+  openclawTimeoutMs,
+}) {
+  const cliArgs = ['cron', 'add', ...buildCommonJobArgs({ workflow, schedule, skillRoot, workspaceRoot })];
+  appendScheduleArgs(cliArgs, schedule);
+  cliArgs.push('--json');
+  cliArgs.push('--timeout', String(openclawTimeoutMs));
+
+  const operation = {
+    type: 'add',
+    scheduleId: schedule.scheduleId,
+    jobId: null,
+    jobName: getManagedJobName(workflow.workflowId, schedule.scheduleId),
+    cliArgs,
+    gatewayMethod: 'cron.add',
+    gatewayParams: buildGatewayJobCreate({ workflow, schedule, skillRoot, workspaceRoot }),
+    applied: false,
+  };
+  operation.remediation = buildOperationRemediation({
+    operation,
+    openclawCommand,
+    openclawTimeoutMs,
+  });
+  return operation;
+}
+
+function buildEditOperation({
+  workflow,
+  schedule,
+  existingJob,
+  skillRoot,
+  workspaceRoot,
+  openclawCommand,
+  openclawTimeoutMs,
+}) {
+  const jobId = existingJob.id || existingJob.jobId || null;
+  const cliArgs = ['cron', 'edit', jobId, ...buildCommonJobArgs({ workflow, schedule, skillRoot, workspaceRoot }), '--enable'];
+  appendScheduleArgs(cliArgs, schedule);
+  cliArgs.push('--timeout', String(openclawTimeoutMs));
+
+  const operation = {
+    type: 'edit',
+    scheduleId: schedule.scheduleId,
+    jobId,
+    jobName: getManagedJobName(workflow.workflowId, schedule.scheduleId),
+    cliArgs,
+    gatewayMethod: 'cron.update',
+    gatewayParams: {
+      id: jobId,
+      patch: buildGatewayJobPatch({ workflow, schedule, skillRoot, workspaceRoot }),
+    },
+    applied: false,
+  };
+  operation.remediation = buildOperationRemediation({
+    operation,
+    openclawCommand,
+    openclawTimeoutMs,
+  });
+  return operation;
+}
+
+function buildDisableOperation({
+  workflow,
+  scheduleId,
+  jobId,
+  type = 'disable',
+  openclawCommand,
+  openclawTimeoutMs,
+}) {
+  const operation = {
+    type,
+    scheduleId,
+    jobId,
+    cliArgs: ['cron', 'disable', jobId, '--timeout', String(openclawTimeoutMs)],
+    gatewayMethod: 'cron.update',
+    gatewayParams: {
+      id: jobId,
+      patch: { enabled: false },
+    },
+    applied: false,
+  };
+  operation.remediation = buildOperationRemediation({
+    operation,
+    openclawCommand,
+    openclawTimeoutMs,
+  });
+  return operation;
+}
+
+function buildWorkflowSyncPlan({
+  workspaceRoot,
+  workflow,
+  skillRoot,
+  jobs,
+  openclawCommand,
+  openclawTimeoutMs,
+}) {
+  const existingManagedJobs = jobs.filter((job) => String(job.name || '').startsWith(`${MANAGED_PREFIX}${workflow.workflowId}::`));
+  const activeSchedules = (workflow.config.schedules || []).filter(isScheduleActive);
+  const operations = [];
+  const syncedSchedules = [];
+
+  for (const schedule of activeSchedules) {
+    const name = getManagedJobName(workflow.workflowId, schedule.scheduleId);
+    const matchingJobs = existingManagedJobs.filter((job) => job.name === name);
+    const existingJob = matchingJobs.find((job) => job.enabled !== false) || matchingJobs[0] || null;
+    if (!existingJob) {
+      operations.push(buildAddOperation({
+        workflow,
+        schedule,
+        skillRoot,
+        workspaceRoot,
+        openclawCommand,
+        openclawTimeoutMs,
+      }));
+      syncedSchedules.push({ scheduleId: schedule.scheduleId, jobId: null, jobName: name, enabled: true });
+      continue;
+    }
+
+    operations.push(buildEditOperation({
+      workflow,
+      schedule,
+      existingJob,
+      skillRoot,
+      workspaceRoot,
+      openclawCommand,
+      openclawTimeoutMs,
+    }));
+    syncedSchedules.push({
+      scheduleId: schedule.scheduleId,
+      jobId: existingJob.id || existingJob.jobId || null,
+      jobName: name,
+      enabled: true,
+    });
+
+    for (const duplicateJob of matchingJobs) {
+      const duplicateJobId = duplicateJob.id || duplicateJob.jobId;
+      const primaryJobId = existingJob.id || existingJob.jobId;
+      if (!duplicateJobId || duplicateJobId === primaryJobId || duplicateJob.enabled === false) continue;
+      operations.push(buildDisableOperation({
+        workflow,
+        scheduleId: schedule.scheduleId,
+        jobId: duplicateJobId,
+        type: 'disable-duplicate',
+        openclawCommand,
+        openclawTimeoutMs,
+      }));
+    }
+  }
+
+  const activeScheduleIds = new Set(activeSchedules.map((schedule) => schedule.scheduleId));
+  for (const job of existingManagedJobs) {
+    const scheduleId = String(job.name).slice(`${MANAGED_PREFIX}${workflow.workflowId}::`.length);
+    if (activeScheduleIds.has(scheduleId)) continue;
+    const jobId = job.id || job.jobId;
+    if (!jobId) continue;
+    operations.push(buildDisableOperation({
+      workflow,
+      scheduleId,
+      jobId,
+      type: 'disable',
+      openclawCommand,
+      openclawTimeoutMs,
+    }));
+  }
+
+  return {
+    operations,
+    syncedSchedules,
+  };
+}
+
+function isRecoverableSyncFailure(error) {
+  const details = String(error?.message || error || '').toLowerCase();
+  if (!details) return false;
+
+  return [
+    'gateway connect failed',
+    'gateway closed',
+    'missing scope:',
+    'operator-level status unavailable',
+    'econnreset',
+    'econnrefused',
+    'etimedout',
+    'socket hang up',
+    'connection reset',
+    'connection aborted',
+    'unexpected eof',
+    'failed to resolve openclaw.cmd',
+    'not recognized as an internal or external command',
+    'command not found',
+    'enoent',
+  ].some((pattern) => details.includes(pattern));
+}
+
+function buildRecoveryCommands({
+  workflow,
+  skillRoot,
+  workspaceRoot,
+  openclawTimeoutMs,
+}) {
+  const normalizedWorkspaceRoot = normalizePath(workspaceRoot);
+  const syncScriptPath = normalizePath(path.join(skillRoot, 'scripts', 'sync-schedules.js'));
+  const doctorScriptPath = normalizePath(path.join(skillRoot, 'scripts', 'doctor.js'));
+  const sharedArgs = [
+    '--workspace-root', normalizedWorkspaceRoot,
+    '--workflow', workflow.workflowId,
+    '--openclaw-timeout-ms', String(openclawTimeoutMs),
+  ];
+
+  return [
+    {
+      label: 'retry-auto',
+      command: 'node',
+      args: [syncScriptPath, ...sharedArgs, '--sync-backend', 'auto'],
+    },
+    {
+      label: 'retry-gateway',
+      command: 'node',
+      args: [syncScriptPath, ...sharedArgs, '--sync-backend', 'gateway'],
+    },
+    {
+      label: 'dry-run-gateway',
+      command: 'node',
+      args: [syncScriptPath, ...sharedArgs, '--sync-backend', 'gateway', '--dry-run'],
+    },
+    {
+      label: 'doctor',
+      command: 'node',
+      args: [doctorScriptPath, ...sharedArgs],
+    },
+  ];
+}
+
+function buildSnapshotJobsFromSyncState(workflow, syncState) {
+  return (Array.isArray(syncState?.schedules) ? syncState.schedules : [])
+    .map((entry) => ({
+      id: entry?.jobId || null,
+      jobId: entry?.jobId || null,
+      name: entry?.jobName || getManagedJobName(workflow.workflowId, entry?.scheduleId),
+      enabled: entry?.enabled !== false,
+    }))
+    .filter((job) => Boolean(job.name));
+}
+
+function buildRecoveryState({
+  workspaceRoot,
+  workflow,
+  skillRoot,
+  requestedBackend,
+  backendAttempts,
+  error,
+  openclawCommand,
+  openclawTimeoutMs,
+}) {
+  const lastSyncState = readSyncState(workspaceRoot, workflow.workflowId);
+  const recoveryCommands = buildRecoveryCommands({
+    workflow,
+    skillRoot,
+    workspaceRoot,
+    openclawTimeoutMs,
+  });
+  const state = {
+    workflowId: workflow.workflowId,
+    generatedAt: new Date().toISOString(),
+    status: 'recovery-only',
+    requestedBackend: normalizeSyncBackend(requestedBackend),
+    selectedBackend: null,
+    backendAttempts: Array.isArray(backendAttempts) ? backendAttempts : [],
+    dryRun: true,
+    recoveryOnly: true,
+    error: error.message || String(error),
+    schedules: [],
+    operations: [],
+    recovery: {
+      mode: 'retry-guidance',
+      summary: 'Live OpenClaw cron state could not be reached. No cron changes were applied.',
+      retryCommands: recoveryCommands,
+      lastSyncState: null,
+      caveats: [
+        'Review gateway health and auth before retrying schedule sync.',
+        'No cron mutation happened in this recovery-only result.',
+      ],
+    },
+  };
+
+  if (!lastSyncState) {
+    state.recovery.caveats.push('No previous sync snapshot was available, so no remediation plan could be derived.');
+    return state;
+  }
+
+  const snapshotJobs = buildSnapshotJobsFromSyncState(workflow, lastSyncState);
+  const plan = buildWorkflowSyncPlan({
+    workspaceRoot,
+    workflow,
+    skillRoot,
+    jobs: snapshotJobs,
+    openclawCommand,
+    openclawTimeoutMs,
+  });
+
+  state.schedules = plan.syncedSchedules;
+  state.operations = plan.operations;
+  state.recovery = {
+    mode: 'sync-state-dry-run',
+    summary: 'Live OpenClaw cron state could not be reached. Returned a best-effort dry-run plan derived from the last successful sync snapshot.',
+    retryCommands: recoveryCommands,
+    lastSyncState: {
+      generatedAt: lastSyncState.generatedAt || null,
+      selectedBackend: lastSyncState.selectedBackend || lastSyncState.requestedBackend || null,
+      scheduleCount: Array.isArray(lastSyncState.schedules) ? lastSyncState.schedules.length : 0,
+    },
+    caveats: [
+      'Review the remediation commands before applying them because the plan is based on the last sync snapshot, not live cron state.',
+      'No cron mutation happened in this recovery-only result.',
+    ],
+  };
+  return state;
+}
+
+function recoverSyncFailure({
+  workspaceRoot,
+  workflow,
+  skillRoot,
+  requestedBackend,
+  backendAttempts,
+  error,
+  openclawCommand,
+  openclawTimeoutMs,
+}) {
+  if (!isRecoverableSyncFailure(error)) return null;
+  return buildRecoveryState({
+    workspaceRoot,
+    workflow,
+    skillRoot,
+    requestedBackend,
+    backendAttempts,
+    error,
+    openclawCommand,
+    openclawTimeoutMs,
+  });
+}
+
+function buildOperationFailurePrefix({ workflow, operation, backend }) {
+  if (operation.type === 'add') {
+    return `Failed to add cron job for ${workflow.workflowId}/${operation.scheduleId} via ${backend} backend`;
+  }
+  if (operation.type === 'edit') {
+    return `Failed to edit cron job for ${workflow.workflowId}/${operation.scheduleId} via ${backend} backend`;
+  }
+  if (operation.type === 'disable-duplicate') {
+    return `Failed to disable duplicate cron job ${operation.jobId || 'unknown-job'} for ${workflow.workflowId}/${operation.scheduleId} via ${backend} backend`;
+  }
+  if (operation.type === 'disable') {
+    return `Failed to disable obsolete cron job ${operation.jobId || 'unknown-job'} for ${workflow.workflowId}/${operation.scheduleId} via ${backend} backend`;
+  }
+  return `Failed to apply ${operation.type} for ${workflow.workflowId}/${operation.scheduleId} via ${backend} backend`;
+}
+
+function executeOperationViaCli({
+  workspaceRoot,
+  workflow,
+  operation,
+  openclawCommand,
+  openclawTimeoutMs,
+  runCommandFn,
+  openclawRetryCount,
+  openclawRetryDelayMs,
+  sleepFn,
+}) {
+  const result = runOpenclawCommand({
+    openclawCommand,
+    args: operation.cliArgs,
+    workspaceRoot,
+    openclawTimeoutMs,
+    runCommandFn,
+    openclawRetryCount,
+    openclawRetryDelayMs,
+    sleepFn,
+  });
+  if (!result.ok) {
+    throw new Error(buildOpenclawFailureMessage({
+      prefix: buildOperationFailurePrefix({ workflow, operation, backend: 'cli' }),
+      result,
+      workspaceRoot,
+      openclawCommand,
+      openclawTimeoutMs,
+      runCommandFn,
+    }));
+  }
+
+  return {
+    jobId: operation.type === 'add' ? parseCronAddJson(result.stdout) : operation.jobId,
+  };
+}
+
+function executeOperationViaGateway({
+  workspaceRoot,
+  workflow,
+  operation,
+  openclawCommand,
+  openclawTimeoutMs,
+  runCommandFn,
+  openclawRetryCount,
+  openclawRetryDelayMs,
+  sleepFn,
+}) {
+  const result = runGatewayMethod({
+    method: operation.gatewayMethod,
+    params: operation.gatewayParams,
+    openclawCommand,
+    workspaceRoot,
+    openclawTimeoutMs,
+    runCommandFn,
+    openclawRetryCount,
+    openclawRetryDelayMs,
+    sleepFn,
+  });
+  if (!result.ok) {
+    throw new Error(buildOpenclawFailureMessage({
+      prefix: buildOperationFailurePrefix({ workflow, operation, backend: 'gateway' }),
+      result,
+      workspaceRoot,
+      openclawCommand,
+      openclawTimeoutMs,
+      runCommandFn,
+    }));
+  }
+
+  const parsed = result.stdout && result.stdout.trim() ? parseOpenclawJson(result.stdout) : null;
+  return {
+    jobId: operation.type === 'add' ? extractCronJobId(parsed) : operation.jobId,
+  };
+}
+
+function executePlannedOperation({
+  workspaceRoot,
+  workflow,
+  operation,
+  selectedBackend,
+  openclawCommand,
+  openclawTimeoutMs,
+  runCommandFn,
+  openclawRetryCount,
+  openclawRetryDelayMs,
+  sleepFn,
+}) {
+  if (selectedBackend === 'gateway') {
+    return executeOperationViaGateway({
+      workspaceRoot,
+      workflow,
+      operation,
+      openclawCommand,
+      openclawTimeoutMs,
+      runCommandFn,
+      openclawRetryCount,
+      openclawRetryDelayMs,
+      sleepFn,
+    });
+  }
+
+  return executeOperationViaCli({
+    workspaceRoot,
+    workflow,
+    operation,
+    openclawCommand,
+    openclawTimeoutMs,
+    runCommandFn,
+    openclawRetryCount,
+    openclawRetryDelayMs,
+    sleepFn,
+  });
+}
+
+function syncWorkflowSchedulesWithBackend({
+  workspaceRoot,
+  workflow,
+  skillRoot,
+  requestedBackend,
+  selectedBackend,
+  dryRun = false,
+  openclawCommand = 'openclaw',
+  openclawTimeoutMs = 30000,
+  openclawRetryCount = DEFAULT_OPENCLAW_RETRY_COUNT,
+  openclawRetryDelayMs = DEFAULT_OPENCLAW_RETRY_DELAY_MS,
+  runCommandFn = runCommand,
+  sleepFn = sleepSync,
+}) {
+  const normalizedBackend = normalizeSyncBackend(selectedBackend);
+  const listResult = listCronJobsResolved({
+    workspaceRoot,
+    openclawCommand,
+    openclawTimeoutMs,
+    syncBackend: normalizedBackend,
+    openclawRetryCount,
+    openclawRetryDelayMs,
+    includeDisabled: true,
+    runCommandFn,
+    sleepFn,
+  });
+  const plan = buildWorkflowSyncPlan({
+    workspaceRoot,
+    workflow,
+    skillRoot,
+    jobs: listResult.jobs,
+    openclawCommand,
+    openclawTimeoutMs,
+  });
+
+  if (!dryRun) {
+    for (const operation of plan.operations) {
+      const execution = executePlannedOperation({
+        workspaceRoot,
+        workflow,
+        operation,
+        selectedBackend: normalizedBackend,
+        openclawCommand,
+        openclawTimeoutMs,
+        runCommandFn,
+        openclawRetryCount,
+        openclawRetryDelayMs,
+        sleepFn,
+      });
+      operation.applied = true;
+      if (operation.type === 'add' && execution.jobId) {
+        operation.jobId = execution.jobId;
+        const syncedSchedule = plan.syncedSchedules.find((entry) => entry.scheduleId === operation.scheduleId);
+        if (syncedSchedule) syncedSchedule.jobId = execution.jobId;
+      }
+    }
+  }
+
+  const state = {
+    workflowId: workflow.workflowId,
+    generatedAt: new Date().toISOString(),
+    status: dryRun ? 'dry-run' : 'synced',
+    requestedBackend: normalizeSyncBackend(requestedBackend),
+    selectedBackend: listResult.selectedBackend || normalizedBackend,
+    backendAttempts: listResult.backendAttempts || [{ backend: normalizedBackend, ok: true }],
+    dryRun: Boolean(dryRun),
+    recoveryOnly: false,
+    error: null,
+    recovery: null,
+    schedules: plan.syncedSchedules,
+    operations: plan.operations,
+  };
+
+  if (!dryRun) {
+    writeSyncState({
+      workspaceRoot,
+      workflowId: workflow.workflowId,
+      state,
+    });
+  }
+
+  return state;
 }
 
 function buildExpectedManagedJob({ workflow, schedule, skillRoot, workspaceRoot }) {
@@ -477,6 +1383,8 @@ function syncWorkflowSchedules({
   workspaceRoot,
   workflow,
   skillRoot,
+  syncBackend = DEFAULT_SYNC_BACKEND,
+  dryRun = false,
   openclawCommand = 'openclaw',
   openclawTimeoutMs = 30000,
   openclawRetryCount = DEFAULT_OPENCLAW_RETRY_COUNT,
@@ -484,149 +1392,108 @@ function syncWorkflowSchedules({
   runCommandFn = runCommand,
   sleepFn = sleepSync,
 }) {
-  const jobs = listCronJobs({
-    workspaceRoot,
-    openclawCommand,
-    openclawTimeoutMs,
-    openclawRetryCount,
-    openclawRetryDelayMs,
-    includeDisabled: true,
-    runCommandFn,
-    sleepFn,
-  });
-  const existingManagedJobs = jobs.filter((job) => String(job.name || '').startsWith(`${MANAGED_PREFIX}${workflow.workflowId}::`));
-  const activeSchedules = (workflow.config.schedules || []).filter(isScheduleActive);
-  const operations = [];
-  const syncedSchedules = [];
-
-  for (const schedule of activeSchedules) {
-    const name = getManagedJobName(workflow.workflowId, schedule.scheduleId);
-    const matchingJobs = existingManagedJobs.filter((job) => job.name === name);
-    const existingJob = matchingJobs.find((job) => job.enabled !== false) || matchingJobs[0] || null;
-    if (!existingJob) {
-      const addArgs = ['cron', 'add', ...buildCommonJobArgs({ workflow, schedule, skillRoot, workspaceRoot })];
-      appendScheduleArgs(addArgs, schedule);
-      addArgs.push('--json');
-      addArgs.push('--timeout', String(openclawTimeoutMs));
-      const addResult = runOpenclawCommand({
-        openclawCommand,
-        args: addArgs,
+  const normalizedBackend = normalizeSyncBackend(syncBackend);
+  if (normalizedBackend !== 'auto') {
+    try {
+      return syncWorkflowSchedulesWithBackend({
         workspaceRoot,
+        workflow,
+        skillRoot,
+        requestedBackend: normalizedBackend,
+        selectedBackend: normalizedBackend,
+        dryRun,
+        openclawCommand,
         openclawTimeoutMs,
-        runCommandFn,
         openclawRetryCount,
         openclawRetryDelayMs,
+        runCommandFn,
         sleepFn,
       });
-      if (!addResult.ok) {
-        throw new Error(buildOpenclawFailureMessage({
-          prefix: `Failed to add cron job for ${workflow.workflowId}/${schedule.scheduleId}`,
-          result: addResult,
-          workspaceRoot,
-          openclawCommand,
-          openclawTimeoutMs,
-          runCommandFn,
-        }));
-      }
-      const jobId = parseCronAddJson(addResult.stdout);
-      operations.push({ type: 'add', scheduleId: schedule.scheduleId, jobId });
-      syncedSchedules.push({ scheduleId: schedule.scheduleId, jobId, jobName: name, enabled: true });
-      continue;
-    }
-
-    const editArgs = ['cron', 'edit', existingJob.id || existingJob.jobId, ...buildCommonJobArgs({ workflow, schedule, skillRoot, workspaceRoot }), '--enable'];
-    appendScheduleArgs(editArgs, schedule);
-    editArgs.push('--timeout', String(openclawTimeoutMs));
-    const editResult = runOpenclawCommand({
-      openclawCommand,
-      args: editArgs,
-      workspaceRoot,
-      openclawTimeoutMs,
-      runCommandFn,
-      openclawRetryCount,
-      openclawRetryDelayMs,
-      sleepFn,
-    });
-    if (!editResult.ok) {
-      throw new Error(buildOpenclawFailureMessage({
-        prefix: `Failed to edit cron job for ${workflow.workflowId}/${schedule.scheduleId}`,
-        result: editResult,
+    } catch (backendError) {
+      const recovered = recoverSyncFailure({
         workspaceRoot,
+        workflow,
+        skillRoot,
+        requestedBackend: normalizedBackend,
+        backendAttempts: [{
+          backend: normalizedBackend,
+          ok: false,
+          error: backendError.message || String(backendError),
+        }],
+        error: backendError,
         openclawCommand,
         openclawTimeoutMs,
-        runCommandFn,
-      }));
-    }
-    operations.push({ type: 'edit', scheduleId: schedule.scheduleId, jobId: existingJob.id || existingJob.jobId });
-    syncedSchedules.push({ scheduleId: schedule.scheduleId, jobId: existingJob.id || existingJob.jobId, jobName: name, enabled: true });
-
-    for (const duplicateJob of matchingJobs) {
-      const duplicateJobId = duplicateJob.id || duplicateJob.jobId;
-      const primaryJobId = existingJob.id || existingJob.jobId;
-      if (!duplicateJobId || duplicateJobId === primaryJobId || duplicateJob.enabled === false) continue;
-      const duplicateDisableResult = runOpenclawCommand({
-        openclawCommand,
-        args: ['cron', 'disable', duplicateJobId, '--timeout', String(openclawTimeoutMs)],
-        workspaceRoot,
-        openclawTimeoutMs,
-        runCommandFn,
-        openclawRetryCount,
-        openclawRetryDelayMs,
-        sleepFn,
       });
-      if (!duplicateDisableResult.ok) {
-        throw new Error(buildOpenclawFailureMessage({
-          prefix: `Failed to disable duplicate cron job ${duplicateJobId} for ${workflow.workflowId}/${schedule.scheduleId}`,
-          result: duplicateDisableResult,
-          workspaceRoot,
-          openclawCommand,
-          openclawTimeoutMs,
-          runCommandFn,
-        }));
-      }
-      operations.push({ type: 'disable-duplicate', scheduleId: schedule.scheduleId, jobId: duplicateJobId });
+      if (recovered) return recovered;
+      throw backendError;
     }
   }
 
-  const activeScheduleIds = new Set(activeSchedules.map((schedule) => schedule.scheduleId));
-  for (const job of existingManagedJobs) {
-    const scheduleId = String(job.name).slice(`${MANAGED_PREFIX}${workflow.workflowId}::`.length);
-    if (activeScheduleIds.has(scheduleId)) continue;
-    const disableResult = runOpenclawCommand({
-      openclawCommand,
-      args: ['cron', 'disable', job.id || job.jobId, '--timeout', String(openclawTimeoutMs)],
+  try {
+    return syncWorkflowSchedulesWithBackend({
       workspaceRoot,
+      workflow,
+      skillRoot,
+      requestedBackend: 'auto',
+      selectedBackend: 'cli',
+      dryRun,
+      openclawCommand,
       openclawTimeoutMs,
-      runCommandFn,
       openclawRetryCount,
       openclawRetryDelayMs,
+      runCommandFn,
       sleepFn,
     });
-    if (!disableResult.ok) {
-      throw new Error(buildOpenclawFailureMessage({
-        prefix: `Failed to disable obsolete cron job ${job.id || job.jobId} for ${workflow.workflowId}/${scheduleId}`,
-        result: disableResult,
+  } catch (cliError) {
+    const attempts = [{
+      backend: 'cli',
+      ok: false,
+      error: cliError.message || String(cliError),
+    }];
+    try {
+      const gatewayState = syncWorkflowSchedulesWithBackend({
         workspaceRoot,
+        workflow,
+        skillRoot,
+        requestedBackend: 'auto',
+        selectedBackend: 'gateway',
+        dryRun,
         openclawCommand,
         openclawTimeoutMs,
+        openclawRetryCount,
+        openclawRetryDelayMs,
         runCommandFn,
-      }));
+        sleepFn,
+      });
+      return {
+        ...gatewayState,
+        backendAttempts: [...attempts, ...(gatewayState.backendAttempts || [{ backend: 'gateway', ok: true }])],
+      };
+    } catch (gatewayError) {
+      const gatewayMessage = gatewayError.message || String(gatewayError);
+      const combined = new Error(`Failed to sync workflow schedules via auto backend for ${workflow.workflowId}. CLI error: ${cliError.message || String(cliError)}. Gateway error: ${gatewayMessage}`);
+      combined.backendAttempts = [
+        ...attempts,
+        {
+          backend: 'gateway',
+          ok: false,
+          error: gatewayMessage,
+        },
+      ];
+      const recovered = recoverSyncFailure({
+        workspaceRoot,
+        workflow,
+        skillRoot,
+        requestedBackend: 'auto',
+        backendAttempts: combined.backendAttempts,
+        error: combined,
+        openclawCommand,
+        openclawTimeoutMs,
+      });
+      if (recovered) return recovered;
+      throw combined;
     }
-    operations.push({ type: 'disable', scheduleId, jobId: job.id || job.jobId });
   }
-
-  const state = {
-    workflowId: workflow.workflowId,
-    generatedAt: new Date().toISOString(),
-    schedules: syncedSchedules,
-    operations,
-  };
-  writeSyncState({
-    workspaceRoot,
-    workflowId: workflow.workflowId,
-    state,
-  });
-  return state;
 }
 
 module.exports = {
