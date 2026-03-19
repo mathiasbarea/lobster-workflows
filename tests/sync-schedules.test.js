@@ -740,7 +740,7 @@ test('sync-schedules includes gateway diagnostics when cron list cannot reach us
   assert.equal(persistedState?.lastSuccessfulState, null);
 });
 
-test('sync-schedules reports Windows CLI resolution details with actionable context', { skip: process.platform !== 'win32' }, () => {
+test('sync-schedules reports Windows CLI wrapper resolution details via the shared process runner', { skip: process.platform !== 'win32' }, () => {
   const workspaceRoot = createTempWorkspace();
   const scaffold = scaffoldWorkflow({
     workspaceRoot,
@@ -794,7 +794,7 @@ test('sync-schedules reports Windows CLI resolution details with actionable cont
   fs.mkdirSync(fakeModuleRoot, { recursive: true });
   const fakeCmdPath = path.join(fakeBinRoot, 'openclaw.cmd');
   const fakeMjsPath = path.join(fakeModuleRoot, 'openclaw.mjs');
-  fs.writeFileSync(fakeCmdPath, '@echo off\r\n', 'utf8');
+  fs.writeFileSync(fakeCmdPath, '@echo off\r\n"%~dp0%\\node.exe" "%~dp0%\\node_modules\\openclaw\\openclaw.mjs" %*\r\n', 'utf8');
   fs.writeFileSync(fakeMjsPath, 'console.error("fake openclaw wrapper failed"); process.exit(1);\n', 'utf8');
 
   let thrownError = null;
@@ -813,6 +813,7 @@ test('sync-schedules reports Windows CLI resolution details with actionable cont
 
   assert.match(thrownError?.message || '', /Failed to list cron jobs via cli backend: fake openclaw wrapper failed/u);
   assert.match(thrownError?.message || '', /Invocation: .*openclaw\.mjs cron list --all --json --timeout 30000/u);
+  assert.match(thrownError?.message || '', /Runtime context: platform=win32, shell=false/u);
   assert.match(thrownError?.message || '', /CLI resolution: mode=explicit-windows-cmd/u);
   assert.match(thrownError?.message || '', /openclaw\.cmd=/u);
   assert.match(thrownError?.message || '', /openclaw\.mjs=/u);

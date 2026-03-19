@@ -1,6 +1,4 @@
-const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
 
 const { normalizePath } = require('../_lib');
 const { parseJsonFromMixedStdout } = require('./approval-utils');
@@ -19,7 +17,6 @@ const DEFAULT_SYNC_BACKEND = 'auto';
 const DEFAULT_OPENCLAW_RETRY_COUNT = 2;
 const DEFAULT_OPENCLAW_RETRY_DELAY_MS = 750;
 const SYNC_BACKENDS = new Set(['auto', 'cli', 'gateway']);
-const cachedOpenclawCliResolution = new Map();
 
 function getManagedJobName(workflowId, scheduleId) {
   return `${MANAGED_PREFIX}${workflowId}::${scheduleId}`;
@@ -382,110 +379,49 @@ function buildGatewayJobPatch({ workflow, schedule, skillRoot, workspaceRoot }) 
   return patch;
 }
 
-function resolveOpenclawCliResolution(openclawCommand) {
-  const cacheKey = String(openclawCommand || 'openclaw');
-  if (cachedOpenclawCliResolution.has(cacheKey)) {
-    return cachedOpenclawCliResolution.get(cacheKey);
-  }
-
-  if (path.isAbsolute(openclawCommand) && openclawCommand.toLowerCase().endsWith('.cmd')) {
-    const candidate = path.join(path.dirname(openclawCommand), 'node_modules', 'openclaw', 'openclaw.mjs');
-    if (fs.existsSync(candidate)) {
-      const resolution = {
-        requestedCommand: openclawCommand,
-        cliCmdPath: openclawCommand,
-        cliScriptPath: candidate,
-        resolutionMode: 'explicit-windows-cmd',
-      };
-      cachedOpenclawCliResolution.set(cacheKey, resolution);
-      return resolution;
-    }
-  }
-
-  const whereResult = spawnSync('where.exe', ['openclaw.cmd'], {
-    encoding: 'utf8',
-    stdio: 'pipe',
-    shell: false,
-    timeout: 10000,
-  });
-  if (whereResult.status !== 0 || !whereResult.stdout) {
-    throw new Error(`Failed to resolve openclaw.cmd: ${whereResult.stderr || whereResult.error?.message || 'unknown error'}`);
-  }
-
-  const cmdPath = whereResult.stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find(Boolean);
-  if (!cmdPath) {
-    throw new Error('Failed to resolve openclaw.cmd from PATH');
-  }
-
-  const candidate = path.join(path.dirname(cmdPath), 'node_modules', 'openclaw', 'openclaw.mjs');
-  if (!fs.existsSync(candidate)) {
-    throw new Error(`Resolved openclaw.mjs does not exist: ${candidate}`);
-  }
-
-  const resolution = {
-    requestedCommand: openclawCommand,
-    cliCmdPath: cmdPath,
-    cliScriptPath: candidate,
-    resolutionMode: 'where-openclaw-cmd',
-  };
-  cachedOpenclawCliResolution.set(cacheKey, resolution);
-  return resolution;
-}
-
-function buildOpenclawInvocation(openclawCommand, args, runCommandFn) {
-  if (process.platform !== 'win32' || runCommandFn !== runCommand) {
-    return {
-      command: openclawCommand,
-      args,
-      shell: true,
-      diagnostics: {
-        platform: process.platform,
-        shell: true,
-        requestedCommand: openclawCommand,
-        resolutionMode: process.platform === 'win32' ? 'custom-runner' : 'direct',
-        display: formatInvocationForDisplay(openclawCommand, args),
-      },
-    };
-  }
-
-  const resolution = resolveOpenclawCliResolution(openclawCommand);
-  const invocationArgs = [resolution.cliScriptPath, ...args];
+function buildRequestedOpenclawInvocation(openclawCommand, args, runCommandFn) {
   return {
-    command: process.execPath,
-    args: invocationArgs,
+    platform: process.platform,
     shell: false,
-    diagnostics: {
-      platform: process.platform,
-      shell: false,
-      requestedCommand: openclawCommand,
-      resolutionMode: resolution.resolutionMode,
-      cliCmdPath: resolution.cliCmdPath,
-      cliScriptPath: resolution.cliScriptPath,
-      display: formatInvocationForDisplay(process.execPath, invocationArgs),
-    },
+    requestedCommand: openclawCommand,
+    resolutionMode: runCommandFn === runCommand ? 'direct' : 'custom-runner',
+    display: formatInvocationForDisplay(openclawCommand, args),
   };
 }
 
-function buildOpenclawInvocationResolutionFailureMessage({
-  error,
+function attachOpenclawInvocation(result, {
   openclawCommand,
   args,
+  runCommandFn,
 }) {
-  const details = error?.message || String(error);
-  const sections = [
-    `Failed to prepare OpenClaw invocation: ${details}`,
-    `Invocation request: ${formatInvocationForDisplay(openclawCommand, args)}`,
-    `Runtime context: platform=${process.platform}, shell=false`,
-  ];
-  const recommendation = buildFailureRecommendation({
-    result: null,
-    details,
-  });
-  if (recommendation) sections.push(`Recommendation: ${recommendation}`);
-  return sections.join('\n');
+  const normalizedResult = result && typeof result === 'object'
+    ? { ...result }
+    : {
+      ok: false,
+      stdout: '',
+      stderr: '',
+      errorMessage: 'OpenClaw command did not return a structured result',
+    };
+
+  const normalizedCommand = normalizedResult.command || openclawCommand;
+  const normalizedArgs = Array.isArray(normalizedResult.args) ? normalizedResult.args : args;
+  const invocation = {
+    ...buildRequestedOpenclawInvocation(openclawCommand, args, runCommandFn),
+    ...(normalizedResult.invocation || {}),
+  };
+  if (!normalizedResult.invocation?.display) {
+    invocation.display = formatInvocationForDisplay(normalizedCommand, normalizedArgs);
+  }
+  if (!invocation.requestedCommand) {
+    invocation.requestedCommand = openclawCommand;
+  }
+
+  return {
+    ...normalizedResult,
+    command: normalizedCommand,
+    args: normalizedArgs,
+    invocation,
+  };
 }
 
 function runOpenclawCommand({
@@ -498,32 +434,24 @@ function runOpenclawCommand({
   openclawRetryDelayMs = DEFAULT_OPENCLAW_RETRY_DELAY_MS,
   sleepFn = sleepSync,
 }) {
-  let invocation;
-  try {
-    invocation = buildOpenclawInvocation(openclawCommand, args, runCommandFn);
-  } catch (error) {
-    throw new Error(buildOpenclawInvocationResolutionFailureMessage({
-      error,
-      openclawCommand,
-      args,
-    }));
-  }
   const maxRetries = Math.max(0, Number.isFinite(openclawRetryCount) ? Math.floor(openclawRetryCount) : DEFAULT_OPENCLAW_RETRY_COUNT);
   let attempt = 0;
   let lastResult = null;
 
   while (attempt <= maxRetries) {
-    const result = runCommandFn(invocation.command, invocation.args, {
+    const result = attachOpenclawInvocation(runCommandFn(openclawCommand, args, {
       cwd: workspaceRoot,
       timeoutMs: openclawTimeoutMs + 10000,
-      shell: invocation.shell,
+    }), {
+      openclawCommand,
+      args,
+      runCommandFn,
     });
     if (result.ok) {
       return {
         ...result,
         attemptCount: attempt + 1,
         retryCount: attempt,
-        invocation: invocation.diagnostics,
       };
     }
 
@@ -533,7 +461,6 @@ function runOpenclawCommand({
         ...result,
         attemptCount: attempt + 1,
         retryCount: attempt,
-        invocation: invocation.diagnostics,
       };
     }
 
@@ -546,7 +473,6 @@ function runOpenclawCommand({
     ...lastResult,
     attemptCount: maxRetries + 1,
     retryCount: maxRetries,
-    invocation: invocation.diagnostics,
   };
 }
 

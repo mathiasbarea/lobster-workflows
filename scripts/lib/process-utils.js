@@ -14,11 +14,17 @@ function quoteWindowsArg(value) {
 function parseNodeScriptFromCmdWrapper(commandPath) {
   if (!fs.existsSync(commandPath)) return null;
   const content = fs.readFileSync(commandPath, 'utf8');
-  const match = content.match(/"%dp0%\\([^"]+\.(?:mjs|js))"/i);
-  if (!match) return null;
-  const relativeScriptPath = match[1].replace(/\\/g, path.sep);
-  const scriptPath = path.join(path.dirname(commandPath), relativeScriptPath);
-  return fs.existsSync(scriptPath) ? scriptPath : null;
+  const scriptMatches = content.matchAll(/"(%~?dp0%?\\[^"]+\.(?:mjs|js))"/ig);
+  for (const match of scriptMatches) {
+    const relativeScriptPath = match[1]
+      .replace(/^%~?dp0%?\\/i, '')
+      .replace(/\\/g, path.sep);
+    const scriptPath = path.join(path.dirname(commandPath), relativeScriptPath);
+    if (fs.existsSync(scriptPath)) {
+      return scriptPath;
+    }
+  }
+  return null;
 }
 
 function resolveWindowsCliCommand(command, env) {
@@ -28,6 +34,7 @@ function resolveWindowsCliCommand(command, env) {
   }
 
   let commandPath = command;
+  let resolvedViaWhere = false;
   if (!path.isAbsolute(commandPath) || !fs.existsSync(commandPath)) {
     const lookupTarget = commandPath.toLowerCase().endsWith('.cmd') ? commandPath : `${commandPath}.cmd`;
     const whereResult = spawnSync('where.exe', [lookupTarget], {
@@ -43,14 +50,30 @@ function resolveWindowsCliCommand(command, env) {
         .find(Boolean);
       if (candidate) {
         commandPath = candidate;
+        resolvedViaWhere = true;
       }
     }
   }
 
-  const scriptPath = commandPath.toLowerCase().endsWith('.cmd') ? parseNodeScriptFromCmdWrapper(commandPath) : null;
+  const isCmdWrapper = String(commandPath).toLowerCase().endsWith('.cmd');
+  const scriptPath = isCmdWrapper ? parseNodeScriptFromCmdWrapper(commandPath) : null;
   const resolved = scriptPath
-    ? { command: process.execPath, argsPrefix: [scriptPath] }
-    : { command: process.env.ComSpec || 'cmd.exe', argsPrefix: ['/d', '/s', '/c', quoteWindowsArg(commandPath)] };
+    ? {
+      command: process.execPath,
+      argsPrefix: [scriptPath],
+      resolutionMode: resolvedViaWhere ? 'where-openclaw-cmd' : 'explicit-windows-cmd',
+      cliCmdPath: commandPath,
+      cliScriptPath: scriptPath,
+    }
+    : {
+      command: process.env.ComSpec || 'cmd.exe',
+      argsPrefix: ['/d', '/s', '/c', quoteWindowsArg(commandPath)],
+      resolutionMode: isCmdWrapper
+        ? (resolvedViaWhere ? 'where-openclaw-cmd-shell' : 'explicit-windows-cmd-shell')
+        : 'windows-shell-command',
+      cliCmdPath: isCmdWrapper ? commandPath : null,
+      cliScriptPath: null,
+    };
   resolvedWindowsCliCache.set(cacheKey, resolved);
   return resolved;
 }
@@ -61,6 +84,12 @@ function prepareInvocation(command, args, options = {}) {
       command,
       args,
       shell: options.shell || false,
+      diagnostics: {
+        platform: process.platform,
+        shell: options.shell || false,
+        requestedCommand: command,
+        resolutionMode: 'direct',
+      },
     };
   }
 
@@ -74,6 +103,12 @@ function prepareInvocation(command, args, options = {}) {
       command,
       args,
       shell: false,
+      diagnostics: {
+        platform: process.platform,
+        shell: false,
+        requestedCommand: command,
+        resolutionMode: 'direct',
+      },
     };
   }
 
@@ -83,6 +118,14 @@ function prepareInvocation(command, args, options = {}) {
       command: process.execPath,
       args: [...resolved.argsPrefix, ...args],
       shell: false,
+      diagnostics: {
+        platform: process.platform,
+        shell: false,
+        requestedCommand: command,
+        resolutionMode: resolved.resolutionMode,
+        cliCmdPath: resolved.cliCmdPath,
+        cliScriptPath: resolved.cliScriptPath,
+      },
     };
   }
 
@@ -90,6 +133,14 @@ function prepareInvocation(command, args, options = {}) {
     command: resolved.command,
     args: [...resolved.argsPrefix.slice(0, -1), `${resolved.argsPrefix.at(-1)} ${args.map(quoteWindowsArg).join(' ')}`],
     shell: false,
+    diagnostics: {
+      platform: process.platform,
+      shell: false,
+      requestedCommand: command,
+      resolutionMode: resolved.resolutionMode,
+      cliCmdPath: resolved.cliCmdPath,
+      cliScriptPath: resolved.cliScriptPath,
+    },
   };
 }
 
@@ -119,6 +170,7 @@ function runCommand(command, args = [], options = {}) {
     stdout: result.stdout || '',
     stderr: result.stderr || '',
     errorMessage: result.error ? String(result.error.message || result.error) : null,
+    invocation: invocation.diagnostics,
     timedOut: Boolean(
       (options.timeoutMs && result.error && /timed out|ETIMEDOUT/i.test(String(result.error.message || result.error))) ||
       result.signal === 'SIGTERM'
@@ -127,5 +179,6 @@ function runCommand(command, args = [], options = {}) {
 }
 
 module.exports = {
+  prepareInvocation,
   runCommand,
 };
