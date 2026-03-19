@@ -118,6 +118,7 @@ node scripts/sync-schedules.js --workspace-root /path/to/workspace --dry-run
 `--sync-backend` accepts `auto`, `cli`, or `gateway`. `--dry-run` computes the reconciliation plan and remediation commands without mutating OpenClaw cron or writing sync state.
 When `auto` cannot use the CLI transport, it retries through the gateway. If live cron state is still unreachable, the script returns `status: "recovery-only"` with retry commands and, when possible, a dry-run remediation plan derived from the last successful sync snapshot.
 Persisted sync state now records both the latest attempt and the last confirmed successful sync, so `_executions/sync/<workflow>.json` can explicitly show `synced`, `failed`, `partial`, or `recovery-only`.
+Operational sync failures now include the exact invocation, stdout/stderr, Windows CLI resolution context when relevant, and a recommendation matched to the failure class.
 ### 5. Rebuild the daily summary
 
 ```Bash

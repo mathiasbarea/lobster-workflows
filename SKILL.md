@@ -88,6 +88,7 @@ node scripts/rebuild-daily-summary.js --workspace-root <path> --date YYYY-MM-DD
 - Use `--dry-run` when you need a deterministic reconciliation plan and actionable remediation commands without mutating cron state
 - Treat the persisted sync file as attempt state, not just success state: it may explicitly be `synced`, `failed`, `partial`, or `recovery-only`
 - If schedule sync returns `status: "recovery-only"`, no cron mutation happened; use `recovery.retryCommands` or `operations[].remediation` instead of claiming the sync succeeded
+- If schedule sync fails operationally, inspect the emitted invocation, stdout/stderr, CLI resolution context, and recommendation before retrying manually
 - If schedule drift is suspected or the user asks for a health check, run `node scripts/doctor.js --workspace-root <path>` and use `--fix` when the user wants reconciliation applied automatically
 
 ## Workflow Creation Checklist

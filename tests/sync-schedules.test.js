@@ -418,17 +418,17 @@ test('sync-schedules falls back from cli to gateway when auto backend hits a cli
   });
 
   assert.equal(result.workflows[0].selectedBackend, 'gateway');
-  assert.deepEqual(result.workflows[0].backendAttempts, [
-    {
-      backend: 'cli',
-      ok: false,
-      error: 'Failed to list cron jobs via cli backend: gateway connect failed: Error: gateway closed (1000 normal closure): no close reason. Gateway diagnostics: gateway RPC ok (ws://127.0.0.1:18789; listening 127.0.0.1:18789); operator-level status unavailable (missing scope: operator.read)',
-    },
-    {
-      backend: 'gateway',
-      ok: true,
-    },
-  ]);
+  assert.equal(result.workflows[0].backendAttempts.length, 2);
+  assert.equal(result.workflows[0].backendAttempts[0].backend, 'cli');
+  assert.equal(result.workflows[0].backendAttempts[0].ok, false);
+  assert.match(result.workflows[0].backendAttempts[0].error, /Failed to list cron jobs via cli backend/u);
+  assert.match(result.workflows[0].backendAttempts[0].error, /Gateway diagnostics: gateway RPC ok/u);
+  assert.match(result.workflows[0].backendAttempts[0].error, /Invocation:/u);
+  assert.match(result.workflows[0].backendAttempts[0].error, /Recommendation:/u);
+  assert.deepEqual(result.workflows[0].backendAttempts[1], {
+    backend: 'gateway',
+    ok: true,
+  });
   assert.equal(result.workflows[0].operations.some((operation) => operation.type === 'add' && operation.applied === true), true);
   assert.equal(calls.some((call) => call.args[0] === 'cron' && call.args[1] === 'add'), false);
   assert.equal(calls.some((call) => call.args[2] === 'cron.add'), true);
@@ -593,17 +593,27 @@ test('sync-schedules fails fast for non-transient cron list failures', () => {
     throw new Error(`Unexpected command: ${command} ${args.join(' ')}`);
   };
 
-  assert.throws(() => syncSchedules({
-    workspaceRoot,
-    workflowId: 'daily-report',
-    skillRoot,
-    syncBackend: 'cli',
-    openclawCommand: 'openclaw',
-    openclawRetryCount: 2,
-    openclawRetryDelayMs: 5,
-    runCommandFn,
-    sleepFn: (delayMs) => sleepCalls.push(delayMs),
-  }), /Failed to list cron jobs via cli backend: invalid option: --bogus/u);
+  let thrownError = null;
+  try {
+    syncSchedules({
+      workspaceRoot,
+      workflowId: 'daily-report',
+      skillRoot,
+      syncBackend: 'cli',
+      openclawCommand: 'openclaw',
+      openclawRetryCount: 2,
+      openclawRetryDelayMs: 5,
+      runCommandFn,
+      sleepFn: (delayMs) => sleepCalls.push(delayMs),
+    });
+  } catch (error) {
+    thrownError = error;
+  }
+
+  assert.match(thrownError?.message || '', /Failed to list cron jobs via cli backend: invalid option: --bogus/u);
+  assert.match(thrownError?.message || '', /Invocation: openclaw cron list --all --json --timeout 30000/u);
+  assert.match(thrownError?.message || '', /stderr: invalid option: --bogus/u);
+  assert.match(thrownError?.message || '', /Recommendation: The installed OpenClaw CLI does not support this cron command shape/u);
 
   assert.equal(listAttempts, 1);
   assert.deepEqual(sleepCalls, []);
@@ -719,12 +729,98 @@ test('sync-schedules includes gateway diagnostics when cron list cannot reach us
 
   assert.equal(result.workflows[0].status, 'recovery-only');
   assert.match(result.workflows[0].error, /Gateway diagnostics: gateway RPC ok \(ws:\/\/127\.0\.0\.1:18789; listening 127\.0\.0\.1:18789\); operator-level status unavailable \(missing scope: operator\.read\)/u);
+  assert.match(result.workflows[0].error, /Invocation: openclaw cron list --all --json --timeout 30000/u);
+  assert.match(result.workflows[0].error, /stderr: gateway connect failed/u);
+  assert.match(result.workflows[0].error, /Recommendation:/u);
   assert.equal(result.workflows[0].operations.length, 0);
   assert.equal(result.workflows[0].recovery?.mode, 'retry-guidance');
   const persistedState = readSyncState(workspaceRoot, 'daily-report');
   assert.equal(persistedState?.status, 'recovery-only');
   assert.equal(persistedState?.recoveryOnly, true);
   assert.equal(persistedState?.lastSuccessfulState, null);
+});
+
+test('sync-schedules reports Windows CLI resolution details with actionable context', { skip: process.platform !== 'win32' }, () => {
+  const workspaceRoot = createTempWorkspace();
+  const scaffold = scaffoldWorkflow({
+    workspaceRoot,
+    workflowId: 'daily-report',
+    displayName: 'Daily Report',
+    description: 'Daily report workflow',
+  });
+
+  writeWorkflowConfig(scaffold.workflowRoot, `module.exports = {
+  identity: {
+    workflowId: 'daily-report',
+    displayName: 'Daily Report',
+    description: 'Daily report workflow',
+  },
+  runtime: {
+    runnerType: 'node',
+    entrypoint: 'run-workflow.js',
+    defaultAction: 'run',
+    workingDirectory: '.',
+    defaultInputs: {},
+  },
+  schedules: [
+    {
+      scheduleId: 'morning',
+      kind: 'cron',
+      cron: '0 7 * * *',
+      timezone: 'UTC',
+      enabled: true,
+    },
+  ],
+  result: {
+    resultType: 'object',
+    resultDescription: 'Canonical workflow result payload',
+    latestResultPolicy: 'on-success',
+    extractor: {
+      sourceAction: 'run',
+      dataPath: null,
+    },
+  },
+  observability: {
+    successCondition: {
+      ok: true,
+    },
+    defaultTimeoutMs: 30000,
+  },
+};
+`);
+
+  const fakeBinRoot = path.join(workspaceRoot, 'fake-openclaw');
+  const fakeModuleRoot = path.join(fakeBinRoot, 'node_modules', 'openclaw');
+  fs.mkdirSync(fakeModuleRoot, { recursive: true });
+  const fakeCmdPath = path.join(fakeBinRoot, 'openclaw.cmd');
+  const fakeMjsPath = path.join(fakeModuleRoot, 'openclaw.mjs');
+  fs.writeFileSync(fakeCmdPath, '@echo off\r\n', 'utf8');
+  fs.writeFileSync(fakeMjsPath, 'console.error("fake openclaw wrapper failed"); process.exit(1);\n', 'utf8');
+
+  let thrownError = null;
+  try {
+    syncSchedules({
+      workspaceRoot,
+      workflowId: 'daily-report',
+      skillRoot,
+      syncBackend: 'cli',
+      openclawCommand: fakeCmdPath,
+      openclawRetryCount: 0,
+    });
+  } catch (error) {
+    thrownError = error;
+  }
+
+  assert.match(thrownError?.message || '', /Failed to list cron jobs via cli backend: fake openclaw wrapper failed/u);
+  assert.match(thrownError?.message || '', /Invocation: .*openclaw\.mjs cron list --all --json --timeout 30000/u);
+  assert.match(thrownError?.message || '', /CLI resolution: mode=explicit-windows-cmd/u);
+  assert.match(thrownError?.message || '', /openclaw\.cmd=/u);
+  assert.match(thrownError?.message || '', /openclaw\.mjs=/u);
+  assert.match(thrownError?.message || '', /stderr: fake openclaw wrapper failed/u);
+  assert.match(thrownError?.message || '', /Recommendation:/u);
+  const persistedState = readSyncState(workspaceRoot, 'daily-report');
+  assert.equal(persistedState?.status, 'failed');
+  assert.match(persistedState?.error || '', /fake openclaw wrapper failed/u);
 });
 
 test('sync-schedules dry-run returns planned operations and remediation without mutating sync state', () => {
