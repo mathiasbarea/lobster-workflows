@@ -34,7 +34,9 @@ test('new-workflow creates a runnable workflow scaffold', async () => {
   });
 
   assert.equal(config.identity.workflowId, 'daily-report');
-  assert.match(lobsterFile, /default: \.\/workflows\/daily-report/);
+  assert.equal(config.runtime.runnerType, 'lobster');
+  assert.equal(config.runtime.entrypoint, 'daily-report.lobster');
+  assert.match(lobsterFile, /node \.\/run-workflow\.js/);
   assert.doesNotMatch(lobsterFile, new RegExp(result.workflowRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.equal(runResult.ok, true);
   assert.equal(runResult.data.workflowId, 'daily-report');

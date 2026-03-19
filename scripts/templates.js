@@ -251,8 +251,8 @@ function createWorkflowConfigContent({ workflowId, displayName, description }) {
     description: '${escapeForSingleQuotedJs(description)}',
   },
   runtime: {
-    runnerType: 'node',
-    entrypoint: 'run-workflow.js',
+    runnerType: 'lobster',
+    entrypoint: '${escapeForSingleQuotedJs(workflowId)}.lobster',
     defaultAction: 'run',
     workingDirectory: '.',
     defaultInputs: {},
@@ -263,13 +263,13 @@ function createWorkflowConfigContent({ workflowId, displayName, description }) {
     resultDescription: 'Canonical workflow result payload',
     latestResultPolicy: 'on-success',
     extractor: {
-      sourceAction: 'run',
-      dataPath: null,
+      dataPath: 'output.0.data',
     },
   },
   observability: {
     successCondition: {
       ok: true,
+      status: 'ok',
     },
     defaultTimeoutMs: 30000,
   },
@@ -329,13 +329,10 @@ The scaffold action has no side effects. Replace it with workflow-specific behav
 
 function createWorkflowLobsterContent({ workflowId }) {
   return `name: ${workflowId}
-args:
-  workflowRoot:
-    default: ./workflows/${workflowId}
 steps:
   - id: run
     run: >
-      node \${workflowRoot}/run-workflow.js
+      node ./run-workflow.js
       --action run
 `;
 }
@@ -478,6 +475,8 @@ test('default run action returns success envelope', async () => {
   assert.equal(result.data.workflowId, '${escapeForSingleQuotedJs(workflowId)}');
   assert.equal(result.data.status, 'ok');
   assert.deepEqual(result.data.receivedInput, { hello: 'world' });
+  assert.equal(config.runtime.runnerType, 'lobster');
+  assert.equal(config.runtime.entrypoint, '${escapeForSingleQuotedJs(workflowId)}.lobster');
 });
 `;
 }

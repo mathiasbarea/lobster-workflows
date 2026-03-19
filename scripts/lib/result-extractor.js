@@ -27,8 +27,23 @@ function extractWorkflowResult({ config, envelope }) {
   return getValueAtPath(root, extractor.dataPath || null);
 }
 
+function isApprovalEnvelope(envelope) {
+  return Boolean(
+    envelope &&
+    envelope.ok === true &&
+    envelope.status === 'needs_approval' &&
+    envelope.requiresApproval &&
+    envelope.requiresApproval.resumeToken
+  );
+}
+
+function isCancelledEnvelope(envelope) {
+  return Boolean(envelope && envelope.status === 'cancelled');
+}
+
 function isSuccessfulEnvelope({ config, envelope, processResult }) {
   if (!processResult.ok) return false;
+  if (isApprovalEnvelope(envelope) || isCancelledEnvelope(envelope)) return false;
   const successCondition = config.observability?.successCondition;
   if (!successCondition) return true;
   return isSubsetMatch(envelope, successCondition);
@@ -37,5 +52,7 @@ function isSuccessfulEnvelope({ config, envelope, processResult }) {
 module.exports = {
   extractWorkflowResult,
   getValueAtPath,
+  isApprovalEnvelope,
+  isCancelledEnvelope,
   isSuccessfulEnvelope,
 };

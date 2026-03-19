@@ -1,0 +1,10 @@
+{
+  "name": "lobster-workflows-telegram",
+  "private": true,
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  }
+}

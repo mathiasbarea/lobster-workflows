@@ -2,9 +2,19 @@
 const path = require('path');
 
 const { ensureArg, normalizePath, parseArgs, printJson } = require('./_lib');
+const {
+  createApprovalCallbackToken,
+  resolveTelegramApprovers,
+  sendTelegramApprovalRequests,
+} = require('./lib/approval-utils');
 const { createExecutionId, writeLatestResult, writeRunRecord } = require('./lib/execution-store');
 const { runCommand } = require('./lib/process-utils');
-const { extractWorkflowResult, isSuccessfulEnvelope } = require('./lib/result-extractor');
+const {
+  extractWorkflowResult,
+  isApprovalEnvelope,
+  isCancelledEnvelope,
+  isSuccessfulEnvelope,
+} = require('./lib/result-extractor');
 const { resolveScheduledOccurrence } = require('./lib/schedule-engine');
 const { loadWorkflow } = require('./lib/workflow-loader');
 
@@ -14,7 +24,7 @@ function trimText(text, maxLength = 4000) {
   return value.slice(value.length - maxLength);
 }
 
-function buildRuntimeInvocation({ workflow, input }) {
+function buildRuntimeInvocation({ workflow, input, env = process.env }) {
   const runtime = workflow.config.runtime;
   const mergedInput = {
     ...(runtime.defaultInputs || {}),
@@ -37,7 +47,7 @@ function buildRuntimeInvocation({ workflow, input }) {
 
   if (runtime.runnerType === 'lobster') {
     return {
-      command: 'lobster',
+      command: env.LOBSTER_WORKFLOWS_LOBSTER_BIN || 'lobster',
       args: [
         'run',
         '--mode',
@@ -60,6 +70,29 @@ function parseJsonOutput(stdout) {
   return JSON.parse(stdout);
 }
 
+function buildApprovalRecord({
+  envelope,
+  callbackToken,
+  requestedAt,
+  approvers = [],
+  decision = null,
+  decidedAt = null,
+  notifications = [],
+}) {
+  return {
+    status: decision ? 'resolved' : 'pending',
+    prompt: envelope.requiresApproval?.prompt || '',
+    items: Array.isArray(envelope.requiresApproval?.items) ? envelope.requiresApproval.items : [],
+    resumeToken: envelope.requiresApproval?.resumeToken || null,
+    callbackToken,
+    requestedAt,
+    approvers,
+    decision,
+    decidedAt,
+    notifications,
+  };
+}
+
 async function runManagedWorkflow({
   workspaceRoot,
   workflowId,
@@ -71,7 +104,7 @@ async function runManagedWorkflow({
 }) {
   const workflow = loadWorkflow(workspaceRoot, workflowId);
   const executionId = createExecutionId({ workflowId, startedAt });
-  const invocation = buildRuntimeInvocation({ workflow, input });
+  const invocation = buildRuntimeInvocation({ workflow, input, env });
   const schedule = scheduleId ? (workflow.config.schedules || []).find((candidate) => candidate.scheduleId === scheduleId) : null;
   const scheduledOccurrence = trigger === 'scheduled' && schedule
     ? resolveScheduledOccurrence({
@@ -110,6 +143,7 @@ async function runManagedWorkflow({
   let status = 'failed';
   let result = null;
   let error = null;
+  let approval = null;
 
   try {
     envelope = parseJsonOutput(processResult.stdout);
@@ -121,13 +155,31 @@ async function runManagedWorkflow({
   }
 
   if (!error) {
-    const successful = isSuccessfulEnvelope({
+    if (isApprovalEnvelope(envelope)) {
+      status = 'awaiting_approval';
+      const approvers = resolveTelegramApprovers({ workflow, env });
+      approval = buildApprovalRecord({
+        envelope,
+        callbackToken: createApprovalCallbackToken(),
+        requestedAt: new Date(Date.parse(startedAt) + processResult.durationMs).toISOString(),
+        approvers,
+      });
+      approval.notifications = sendTelegramApprovalRequests({
+        workflow,
+        executionId,
+        trigger,
+        scheduledFor: initialRecord.scheduledFor,
+        approval,
+        envelope,
+        env,
+      });
+    } else if (isCancelledEnvelope(envelope)) {
+      status = 'cancelled';
+    } else if (isSuccessfulEnvelope({
       config: workflow.config,
       envelope,
       processResult,
-    });
-
-    if (successful) {
+    })) {
       status = 'success';
       result = extractWorkflowResult({
         config: workflow.config,
@@ -150,6 +202,7 @@ async function runManagedWorkflow({
     status,
     result,
     error,
+    approval,
     process: {
       command: invocation.command,
       args: invocation.args,
@@ -191,6 +244,12 @@ async function runManagedWorkflow({
     scheduledFor: record.scheduledFor,
     result,
     error,
+    approval: approval ? {
+      prompt: approval.prompt,
+      callbackToken: approval.callbackToken,
+      approvers: approval.approvers,
+      notifications: approval.notifications,
+    } : null,
   };
 }
 

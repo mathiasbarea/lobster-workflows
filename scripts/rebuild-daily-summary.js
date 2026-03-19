@@ -13,7 +13,9 @@ const { listWorkflowIds, loadWorkflow } = require('./lib/workflow-loader');
 
 function summarizeOccurrenceRuns(runs) {
   if (runs.some((run) => run.status === 'success')) return 'success';
+  if (runs.some((run) => run.status === 'awaiting_approval')) return 'paused';
   if (runs.some((run) => run.status === 'failed')) return 'failed';
+  if (runs.some((run) => run.status === 'cancelled')) return 'failed';
   if (runs.some((run) => run.status === 'abandoned' || run.status === 'running')) return 'abandoned';
   return 'missed';
 }
@@ -37,6 +39,7 @@ function rebuildDailySummary({ workspaceRoot, date }) {
     let startedRuns = 0;
     let successfulRuns = 0;
     let failedRuns = 0;
+    let pausedRuns = 0;
     let abandonedRuns = 0;
     let missedRuns = 0;
 
@@ -46,6 +49,7 @@ function rebuildDailySummary({ workspaceRoot, date }) {
       const status = summarizeOccurrenceRuns(occurrenceRuns);
       if (status === 'success') successfulRuns += 1;
       else if (status === 'failed') failedRuns += 1;
+      else if (status === 'paused') pausedRuns += 1;
       else if (status === 'abandoned') abandonedRuns += 1;
       else missedRuns += 1;
     }
@@ -57,6 +61,7 @@ function rebuildDailySummary({ workspaceRoot, date }) {
       startedRuns,
       successfulRuns,
       failedRuns,
+      pausedRuns,
       abandonedRuns,
       missedRuns,
       manualRuns: manualRuns.length,
@@ -74,6 +79,7 @@ function rebuildDailySummary({ workspaceRoot, date }) {
     startedWorkflows: entries.filter((entry) => entry.startedRuns > 0 || entry.manualRuns > 0).length,
     successfulRuns: entries.reduce((total, entry) => total + entry.successfulRuns, 0),
     failedRuns: entries.reduce((total, entry) => total + entry.failedRuns, 0),
+    pausedRuns: entries.reduce((total, entry) => total + entry.pausedRuns, 0),
     abandonedRuns: entries.reduce((total, entry) => total + entry.abandonedRuns, 0),
     missedRuns: entries.reduce((total, entry) => total + entry.missedRuns, 0),
     manualRuns: entries.reduce((total, entry) => total + entry.manualRuns, 0),

@@ -1,6 +1,7 @@
 ---
 name: lobster-workflows
-description: Create and manage Lobster-based workflow workspaces, shared workflow libraries, workflow scaffolds, OpenClaw cron schedule sync, and execution metrics under workspace/workflows. Use when a user wants to bootstrap a workflows platform, create a new workflow, standardize workflow structure, or manage workflow scheduling and observability.
+description: "Create and manage Lobster-based workflow workspaces, shared workflow libraries, workflow scaffolds, OpenClaw cron schedule sync, execution metrics, and approval workflows under workspace/workflows. Use when a user wants to bootstrap a workflows platform, create a new workflow, standardize workflow structure, manage scheduling and observability, check pending workflow approvals, or inspect Telegram approval callbacks for managed Lobster workflows, including messages like `/lwf ap:<token>`, `/lwf rj:<token>`, `callback_data: /lwf ap:<token>`, `callback_data: /lwf rj:<token>`, `lwf:ap:<token>`, or `lwf:rj:<token>`."
+user-invocable: true
 ---
 
 # Lobster Workflows
@@ -53,9 +54,22 @@ Use the bundled scripts directly:
 node scripts/bootstrap-workspace.js --workspace-root <path>
 node scripts/new-workflow.js --workspace-root <path> --id <workflow-id>
 node scripts/run-workflow.js --workspace-root <path> --workflow <workflow-id>
+node scripts/list-pending-approvals.js --workspace-root <path>
+node scripts/resume-workflow.js --workspace-root <path> --callback-data '/lwf ap:<token>'
 node scripts/sync-schedules.js --workspace-root <path> [--workflow <workflow-id>]
 node scripts/rebuild-daily-summary.js --workspace-root <path> --date YYYY-MM-DD
 ```
+
+## Approvals
+
+- Managed Lobster workflows may pause with status `awaiting_approval`
+- Approval decisions are Telegram-only and should be resolved from inline button callbacks via the optional `./plugin`
+- Pending approvals may be queried from any chat/channel by using `list-pending-approvals.js`
+- Configure `approvals.telegram.approvers` with numeric Telegram user IDs for authorization
+- Approval delivery is DM-only in this skill
+- Telegram inline buttons should emit the plugin command `/lwf ap:<token>` or `/lwf rj:<token>`
+- The skill runtime stores approval state and provides `resume-workflow.js`; the optional plugin handles Telegram button routing before the message reaches the model
+- Do not infer approval or rejection from free-form chat text; use the callback payload or explicit Telegram-only path
 
 ## Rules
 

@@ -59,6 +59,22 @@ function withDailyCronConfig(scaffold) {
 `);
 }
 
+function writeApprovalRunner(scaffold) {
+  fs.writeFileSync(path.join(scaffold.workflowRoot, 'run-workflow.js'), `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  ok: true,
+  status: 'needs_approval',
+  action: 'run',
+  requiresApproval: {
+    type: 'approval_request',
+    prompt: 'Approve publish?',
+    items: [],
+    resumeToken: 'resume-token-123'
+  }
+}, null, 2));
+`, 'utf8');
+}
+
 test('rebuild-daily-summary counts successful scheduled runs', async () => {
   const workspaceRoot = createTempWorkspace();
   const scaffold = scaffoldWorkflow({
@@ -106,4 +122,34 @@ test('rebuild-daily-summary counts missed runs when no execution happened', () =
   assert.equal(rebuilt.summary.expectedRuns, 1);
   assert.equal(rebuilt.summary.missedRuns, 1);
   assert.equal(rebuilt.summary.successfulRuns, 0);
+});
+
+test('rebuild-daily-summary counts paused runs awaiting approval', async () => {
+  const workspaceRoot = createTempWorkspace();
+  const scaffold = scaffoldWorkflow({
+    workspaceRoot,
+    workflowId: 'daily-report',
+    displayName: 'Daily Report',
+    description: 'Daily report workflow',
+  });
+  withDailyCronConfig(scaffold);
+  writeApprovalRunner(scaffold);
+
+  await runManagedWorkflow({
+    workspaceRoot,
+    workflowId: 'daily-report',
+    trigger: 'scheduled',
+    scheduleId: 'morning',
+    startedAt: '2026-03-18T07:05:00.000Z',
+  });
+
+  const rebuilt = rebuildDailySummary({
+    workspaceRoot,
+    date: '2026-03-18',
+  });
+
+  assert.equal(rebuilt.summary.expectedRuns, 1);
+  assert.equal(rebuilt.summary.pausedRuns, 1);
+  assert.equal(rebuilt.summary.failedRuns, 0);
+  assert.equal(rebuilt.summary.workflows['daily-report'].pausedRuns, 1);
 });

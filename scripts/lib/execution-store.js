@@ -43,6 +43,33 @@ function listRunRecordsForDates(workspaceRoot, dates) {
   return dates.flatMap((date) => listRunRecordsForDate(workspaceRoot, date));
 }
 
+function listAllRunRecords(workspaceRoot) {
+  const runsRoot = getRunsRoot(workspaceRoot);
+  if (!fs.existsSync(runsRoot)) return [];
+
+  return fs.readdirSync(runsRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .flatMap((entry) => listRunRecordsForDate(workspaceRoot, entry.name));
+}
+
+function findRunRecordByExecutionId(workspaceRoot, executionId) {
+  return listAllRunRecords(workspaceRoot).find((record) => record.executionId === executionId) || null;
+}
+
+function findPendingApprovalByCallbackToken(workspaceRoot, callbackToken) {
+  return listAllRunRecords(workspaceRoot).find((record) => (
+    record.status === 'awaiting_approval' &&
+    record.approval &&
+    record.approval.callbackToken === callbackToken
+  )) || null;
+}
+
+function listPendingApprovalRecords(workspaceRoot) {
+  return listAllRunRecords(workspaceRoot)
+    .filter((record) => record.status === 'awaiting_approval' && record.approval && record.approval.resumeToken)
+    .sort((left, right) => String(left.startedAt).localeCompare(String(right.startedAt)));
+}
+
 function writeLatestResult({ workspaceRoot, workflowId, payload }) {
   const filePath = getLatestResultPath(workspaceRoot, workflowId);
   writeJson(filePath, payload);
@@ -77,6 +104,10 @@ function readSyncState(workspaceRoot, workflowId) {
 
 module.exports = {
   createExecutionId,
+  findPendingApprovalByCallbackToken,
+  findRunRecordByExecutionId,
+  listAllRunRecords,
+  listPendingApprovalRecords,
   listRunRecordsForDate,
   listRunRecordsForDates,
   readLatestResult,

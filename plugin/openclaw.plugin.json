@@ -1,0 +1,27 @@
+{
+  "id": "lobster-workflows-telegram",
+  "name": "Lobster Workflows Telegram",
+  "description": "Resolve lobster-workflows Telegram inline approval callbacks through a native /lwf command bridge.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "skillRoot": {
+        "type": "string"
+      },
+      "workspaceRoot": {
+        "type": "string"
+      }
+    }
+  },
+  "uiHints": {
+    "skillRoot": {
+      "label": "Skill root",
+      "help": "Optional absolute path to the installed lobster-workflows skill folder."
+    },
+    "workspaceRoot": {
+      "label": "Workspace root",
+      "help": "Optional absolute path to the workspace root used by managed workflows."
+    }
+  }
+}
