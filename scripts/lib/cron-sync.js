@@ -3,10 +3,16 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const { normalizePath } = require('../_lib');
+const {
+  collectGatewayAccessDiagnostics,
+  summarizeGatewayAccessDiagnostics,
+} = require('./openclaw-health');
 const { runCommand } = require('./process-utils');
 const { writeSyncState } = require('./execution-store');
 
 const MANAGED_PREFIX = 'lobster-workflows::';
+const DEFAULT_OPENCLAW_RETRY_COUNT = 2;
+const DEFAULT_OPENCLAW_RETRY_DELAY_MS = 750;
 let cachedOpenclawCliScriptPath = null;
 
 function getManagedJobName(workflowId, scheduleId) {
@@ -39,6 +45,83 @@ function parseDurationMs(input) {
         : unit === 'h' ? 60 * 60 * 1000
           : 24 * 60 * 60 * 1000;
   return Math.floor(quantity * factor);
+}
+
+function sleepSync(ms) {
+  const delayMs = Number(ms);
+  if (!Number.isFinite(delayMs) || delayMs <= 0) return;
+
+  if (typeof SharedArrayBuffer === 'function' && typeof Atomics?.wait === 'function') {
+    const waitBuffer = new SharedArrayBuffer(4);
+    const waitView = new Int32Array(waitBuffer);
+    Atomics.wait(waitView, 0, 0, delayMs);
+    return;
+  }
+
+  const endAt = Date.now() + delayMs;
+  while (Date.now() < endAt) {
+    // Busy wait is only used on runtimes without Atomics.wait support.
+  }
+}
+
+function getCommandFailureDetails(result) {
+  return String(result?.stderr || result?.stdout || result?.errorMessage || 'unknown error').trim();
+}
+
+function isTransientGatewayFailure(result) {
+  if (!result || result.ok) return false;
+
+  const details = getCommandFailureDetails(result).toLowerCase();
+  if (!details) return false;
+
+  if (result.timedOut && details.includes('gateway')) return true;
+
+  return [
+    'gateway connect failed',
+    'gateway closed',
+    'econnreset',
+    'econnrefused',
+    'etimedout',
+    'socket hang up',
+    'connection reset',
+    'connection aborted',
+    'unexpected eof',
+  ].some((pattern) => details.includes(pattern));
+}
+
+function describeCommandFailure(result) {
+  const details = getCommandFailureDetails(result);
+  const attempts = Number(result?.attemptCount || 1);
+  const retries = Number(result?.retryCount || 0);
+  if (retries <= 0) return details;
+  return `${details} (after ${attempts} attempts, ${retries} retries)`;
+}
+
+function buildOpenclawFailureMessage({
+  prefix,
+  result,
+  workspaceRoot,
+  openclawCommand,
+  openclawTimeoutMs,
+  runCommandFn,
+}) {
+  const details = describeCommandFailure(result);
+  const shouldCollectDiagnostics = isTransientGatewayFailure(result) || /missing scope:/i.test(details);
+  if (!shouldCollectDiagnostics) {
+    return `${prefix}: ${details}`;
+  }
+
+  const diagnosticSummary = summarizeGatewayAccessDiagnostics(collectGatewayAccessDiagnostics({
+    cwd: workspaceRoot,
+    run: runCommandFn,
+    openclawCommand,
+    timeoutMs: Math.max(5000, Math.min(20000, openclawTimeoutMs)),
+  }));
+  if (!diagnosticSummary) {
+    return `${prefix}: ${details}`;
+  }
+
+  return `${prefix}: ${details}. ${diagnosticSummary}`;
 }
 
 function isScheduleActive(schedule) {
@@ -163,21 +246,59 @@ function runOpenclawCommand({
   workspaceRoot,
   openclawTimeoutMs,
   runCommandFn,
+  openclawRetryCount = DEFAULT_OPENCLAW_RETRY_COUNT,
+  openclawRetryDelayMs = DEFAULT_OPENCLAW_RETRY_DELAY_MS,
+  sleepFn = sleepSync,
 }) {
   const invocation = buildOpenclawInvocation(openclawCommand, args, runCommandFn);
-  return runCommandFn(invocation.command, invocation.args, {
-    cwd: workspaceRoot,
-    timeoutMs: openclawTimeoutMs + 10000,
-    shell: invocation.shell,
-  });
+  const maxRetries = Math.max(0, Number.isFinite(openclawRetryCount) ? Math.floor(openclawRetryCount) : DEFAULT_OPENCLAW_RETRY_COUNT);
+  let attempt = 0;
+  let lastResult = null;
+
+  while (attempt <= maxRetries) {
+    const result = runCommandFn(invocation.command, invocation.args, {
+      cwd: workspaceRoot,
+      timeoutMs: openclawTimeoutMs + 10000,
+      shell: invocation.shell,
+    });
+    if (result.ok) {
+      return {
+        ...result,
+        attemptCount: attempt + 1,
+        retryCount: attempt,
+      };
+    }
+
+    lastResult = result;
+    if (!isTransientGatewayFailure(result) || attempt >= maxRetries) {
+      return {
+        ...result,
+        attemptCount: attempt + 1,
+        retryCount: attempt,
+      };
+    }
+
+    const backoffMs = Math.max(0, Math.floor(openclawRetryDelayMs * (attempt + 1)));
+    sleepFn(backoffMs);
+    attempt += 1;
+  }
+
+  return {
+    ...lastResult,
+    attemptCount: maxRetries + 1,
+    retryCount: maxRetries,
+  };
 }
 
 function listCronJobs({
   workspaceRoot,
   openclawCommand = 'openclaw',
   openclawTimeoutMs = 30000,
+  openclawRetryCount = DEFAULT_OPENCLAW_RETRY_COUNT,
+  openclawRetryDelayMs = DEFAULT_OPENCLAW_RETRY_DELAY_MS,
   includeDisabled = true,
   runCommandFn = runCommand,
+  sleepFn = sleepSync,
 }) {
   const args = ['cron', 'list'];
   if (includeDisabled) args.push('--all');
@@ -189,9 +310,19 @@ function listCronJobs({
     workspaceRoot,
     openclawTimeoutMs,
     runCommandFn,
+    openclawRetryCount,
+    openclawRetryDelayMs,
+    sleepFn,
   });
   if (!listResult.ok) {
-    throw new Error(`Failed to list cron jobs: ${listResult.stderr || listResult.errorMessage || 'unknown error'}`);
+    throw new Error(buildOpenclawFailureMessage({
+      prefix: 'Failed to list cron jobs',
+      result: listResult,
+      workspaceRoot,
+      openclawCommand,
+      openclawTimeoutMs,
+      runCommandFn,
+    }));
   }
 
   return parseCronListJson(listResult.stdout);
@@ -348,14 +479,20 @@ function syncWorkflowSchedules({
   skillRoot,
   openclawCommand = 'openclaw',
   openclawTimeoutMs = 30000,
+  openclawRetryCount = DEFAULT_OPENCLAW_RETRY_COUNT,
+  openclawRetryDelayMs = DEFAULT_OPENCLAW_RETRY_DELAY_MS,
   runCommandFn = runCommand,
+  sleepFn = sleepSync,
 }) {
   const jobs = listCronJobs({
     workspaceRoot,
     openclawCommand,
     openclawTimeoutMs,
+    openclawRetryCount,
+    openclawRetryDelayMs,
     includeDisabled: true,
     runCommandFn,
+    sleepFn,
   });
   const existingManagedJobs = jobs.filter((job) => String(job.name || '').startsWith(`${MANAGED_PREFIX}${workflow.workflowId}::`));
   const activeSchedules = (workflow.config.schedules || []).filter(isScheduleActive);
@@ -377,9 +514,19 @@ function syncWorkflowSchedules({
         workspaceRoot,
         openclawTimeoutMs,
         runCommandFn,
+        openclawRetryCount,
+        openclawRetryDelayMs,
+        sleepFn,
       });
       if (!addResult.ok) {
-        throw new Error(`Failed to add cron job for ${workflow.workflowId}/${schedule.scheduleId}: ${addResult.stderr || addResult.errorMessage || 'unknown error'}`);
+        throw new Error(buildOpenclawFailureMessage({
+          prefix: `Failed to add cron job for ${workflow.workflowId}/${schedule.scheduleId}`,
+          result: addResult,
+          workspaceRoot,
+          openclawCommand,
+          openclawTimeoutMs,
+          runCommandFn,
+        }));
       }
       const jobId = parseCronAddJson(addResult.stdout);
       operations.push({ type: 'add', scheduleId: schedule.scheduleId, jobId });
@@ -396,9 +543,19 @@ function syncWorkflowSchedules({
       workspaceRoot,
       openclawTimeoutMs,
       runCommandFn,
+      openclawRetryCount,
+      openclawRetryDelayMs,
+      sleepFn,
     });
     if (!editResult.ok) {
-      throw new Error(`Failed to edit cron job for ${workflow.workflowId}/${schedule.scheduleId}: ${editResult.stderr || editResult.errorMessage || 'unknown error'}`);
+      throw new Error(buildOpenclawFailureMessage({
+        prefix: `Failed to edit cron job for ${workflow.workflowId}/${schedule.scheduleId}`,
+        result: editResult,
+        workspaceRoot,
+        openclawCommand,
+        openclawTimeoutMs,
+        runCommandFn,
+      }));
     }
     operations.push({ type: 'edit', scheduleId: schedule.scheduleId, jobId: existingJob.id || existingJob.jobId });
     syncedSchedules.push({ scheduleId: schedule.scheduleId, jobId: existingJob.id || existingJob.jobId, jobName: name, enabled: true });
@@ -413,9 +570,19 @@ function syncWorkflowSchedules({
         workspaceRoot,
         openclawTimeoutMs,
         runCommandFn,
+        openclawRetryCount,
+        openclawRetryDelayMs,
+        sleepFn,
       });
       if (!duplicateDisableResult.ok) {
-        throw new Error(`Failed to disable duplicate cron job ${duplicateJobId} for ${workflow.workflowId}/${schedule.scheduleId}`);
+        throw new Error(buildOpenclawFailureMessage({
+          prefix: `Failed to disable duplicate cron job ${duplicateJobId} for ${workflow.workflowId}/${schedule.scheduleId}`,
+          result: duplicateDisableResult,
+          workspaceRoot,
+          openclawCommand,
+          openclawTimeoutMs,
+          runCommandFn,
+        }));
       }
       operations.push({ type: 'disable-duplicate', scheduleId: schedule.scheduleId, jobId: duplicateJobId });
     }
@@ -431,9 +598,19 @@ function syncWorkflowSchedules({
       workspaceRoot,
       openclawTimeoutMs,
       runCommandFn,
+      openclawRetryCount,
+      openclawRetryDelayMs,
+      sleepFn,
     });
     if (!disableResult.ok) {
-      throw new Error(`Failed to disable obsolete cron job ${job.id || job.jobId} for ${workflow.workflowId}/${scheduleId}`);
+      throw new Error(buildOpenclawFailureMessage({
+        prefix: `Failed to disable obsolete cron job ${job.id || job.jobId} for ${workflow.workflowId}/${scheduleId}`,
+        result: disableResult,
+        workspaceRoot,
+        openclawCommand,
+        openclawTimeoutMs,
+        runCommandFn,
+      }));
     }
     operations.push({ type: 'disable', scheduleId, jobId: job.id || job.jobId });
   }
@@ -464,5 +641,6 @@ module.exports = {
   parseCronListJson,
   parseDurationMs,
   parseManagedScheduleId,
+  isTransientGatewayFailure,
   syncWorkflowSchedules,
 };

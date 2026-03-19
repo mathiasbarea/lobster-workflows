@@ -7,13 +7,18 @@ const path = require('path');
 const { parseArgs } = require('./_lib');
 const {
   getTelegramBotToken,
-  parseJsonFromMixedStdout,
   resolveTelegramApprovers,
 } = require('./lib/approval-utils');
 const {
   inspectWorkflowScheduleSync,
   listCronJobs,
 } = require('./lib/cron-sync');
+const {
+  collectGatewayAccessDiagnostics,
+  describeCommandFailure,
+  parseJsonCommandOutput,
+  resolveGatewayListeningAddress,
+} = require('./lib/openclaw-health');
 const { runCommand } = require('./lib/process-utils');
 const { syncSchedules } = require('./sync-schedules');
 const { listWorkflowIds, loadWorkflow } = require('./lib/workflow-loader');
@@ -41,26 +46,6 @@ function normalizeComparablePath(filePath) {
     .replace(/[\\/]+/g, '/')
     .replace(/\/$/, '');
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
-}
-
-function describeCommandFailure(step, result) {
-  const stderr = String(result?.stderr || '').trim();
-  const stdout = String(result?.stdout || '').trim();
-  const details = stderr || stdout || result?.errorMessage || 'Unknown error';
-  return `${step} failed: ${details}`;
-}
-
-function parseJsonCommandOutput(step, result) {
-  if (!result.ok) {
-    throw new Error(describeCommandFailure(step, result));
-  }
-
-  const parsed = parseJsonFromMixedStdout(result.stdout);
-  if (!parsed) {
-    throw new Error(`${step} did not return valid JSON output.`);
-  }
-
-  return parsed;
 }
 
 function resolveOpenClawHome(env = process.env) {
@@ -177,6 +162,72 @@ function summarizeScheduleDrift(drifts, maxEntries = 4) {
   if (entries.length === 0) return '';
   const suffix = drifts.length > maxEntries ? `; +${drifts.length - maxEntries} more` : '';
   return `${entries.join('; ')}${suffix}`;
+}
+
+function buildGatewayRpcCheck(gatewayAccess) {
+  if (!gatewayAccess) return null;
+
+  if (gatewayAccess.gatewayStatusError) {
+    return createCheck(
+      'gateway-rpc',
+      'warn',
+      `Could not inspect Gateway RPC health. ${gatewayAccess.gatewayStatusError}`,
+      'Run `openclaw gateway status --json` to inspect transport-level gateway health.',
+    );
+  }
+
+  const gatewayStatus = gatewayAccess.gatewayStatus;
+  if (!gatewayStatus) return null;
+
+  const address = resolveGatewayListeningAddress(gatewayStatus);
+  const rpcUrl = gatewayStatus?.rpc?.url || gatewayStatus?.gateway?.probeUrl || 'unknown url';
+  if (gatewayStatus?.rpc?.ok === true) {
+    const suffix = address ? ` and is listening on ${address}` : '';
+    return createCheck('gateway-rpc', 'ok', `Gateway RPC probe succeeded at ${rpcUrl}${suffix}.`);
+  }
+
+  return createCheck(
+    'gateway-rpc',
+    'fail',
+    `Gateway transport is not responding at ${rpcUrl}.`,
+    'Run `openclaw gateway status` and inspect the gateway service/logs before retrying schedule sync.',
+  );
+}
+
+function buildGatewayOperatorAccessCheck(gatewayAccess) {
+  if (!gatewayAccess) return null;
+
+  if (gatewayAccess.openclawStatusError) {
+    return createCheck(
+      'gateway-operator-access',
+      'warn',
+      `Could not inspect operator-level gateway access. ${gatewayAccess.openclawStatusError}`,
+      'Run `openclaw status --json` to inspect operator-level gateway access from this CLI context.',
+    );
+  }
+
+  const gateway = gatewayAccess.openclawStatus?.gateway;
+  if (!gateway) return null;
+  if (gateway.reachable === true) {
+    return createCheck('gateway-operator-access', 'ok', 'Operator-level gateway status is readable from this CLI context.');
+  }
+
+  const error = gateway.error || 'unknown error';
+  if (/missing scope:\s*operator\.read/i.test(String(error))) {
+    return createCheck(
+      'gateway-operator-access',
+      'warn',
+      `Gateway is up, but operator-level status is not readable from this CLI context (${error}).`,
+      'This limits diagnostics and makes `openclaw status` look unreachable, but it does not automatically mean cron management is down.',
+    );
+  }
+
+  return createCheck(
+    'gateway-operator-access',
+    'warn',
+    `Operator-level gateway access is degraded (${error}).`,
+    'Check gateway auth or scope configuration if managed cron operations also fail.',
+  );
 }
 
 function inspectScheduleSync({
@@ -306,6 +357,7 @@ function evaluateDoctorChecks({
   telegramBotToken,
   globalApprovers,
   configValidation,
+  gatewayAccess = null,
   scheduleSync = null,
 }) {
   const checks = [];
@@ -374,6 +426,12 @@ function evaluateDoctorChecks({
     checks.push(createCheck('openclaw-config', 'ok', 'OpenClaw configuration validates cleanly.'));
   }
 
+  const gatewayRpcCheck = buildGatewayRpcCheck(gatewayAccess);
+  if (gatewayRpcCheck) checks.push(gatewayRpcCheck);
+
+  const gatewayOperatorAccessCheck = buildGatewayOperatorAccessCheck(gatewayAccess);
+  if (gatewayOperatorAccessCheck) checks.push(gatewayOperatorAccessCheck);
+
   if (pluginsAllowError) {
     checks.push(createCheck(
       'plugins-allow',
@@ -426,11 +484,14 @@ function evaluateDoctorChecks({
   }
 
   if (scheduleSync?.error) {
+    const scheduleSyncHint = gatewayAccess?.gatewayStatus?.rpc?.ok === true
+      ? 'Gateway transport is up, so verify cron-management access and auth/scopes from this CLI context before retrying.'
+      : 'Make sure the OpenClaw gateway is reachable, then rerun the doctor.';
     checks.push(createCheck(
       'schedule-sync',
       'fail',
       scheduleSync.error,
-      'Make sure the OpenClaw gateway is reachable, then rerun the doctor.',
+      scheduleSyncHint,
     ));
   } else if (scheduleSync?.skipped) {
     checks.push(createCheck(
@@ -538,6 +599,13 @@ function runDoctor({
   }
 
   const configValidation = validateOpenClawConfig({ cwd: skillRoot, env, run });
+  const gatewayAccess = collectGatewayAccessDiagnostics({
+    cwd: skillRoot,
+    env,
+    run,
+    openclawCommand,
+    timeoutMs: Math.max(10000, Math.min(20000, openclawTimeoutMs)),
+  });
   const resolvedWorkspaceRoot = resolveWorkspaceRoot({
     requestedWorkspaceRoot: workspaceRoot,
     pluginInfo,
@@ -618,12 +686,14 @@ function runDoctor({
     telegramBotToken: getTelegramBotToken(env),
     globalApprovers: resolveTelegramApprovers({ workflow: null, env }),
     configValidation,
+    gatewayAccess,
     scheduleSync,
   });
 
   return {
     skillRoot,
     workspaceRoot: scheduleSync?.workspaceRoot || resolvedWorkspaceRoot || null,
+    gatewayAccess,
     report,
     scheduleSync,
   };

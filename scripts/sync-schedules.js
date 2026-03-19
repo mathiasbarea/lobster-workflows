@@ -11,7 +11,10 @@ function syncSchedules({
   skillRoot = path.resolve(__dirname, '..'),
   openclawCommand = 'openclaw',
   openclawTimeoutMs = 30000,
+  openclawRetryCount,
+  openclawRetryDelayMs,
   runCommandFn,
+  sleepFn,
 }) {
   const targetWorkflowIds = workflowId ? [workflowId] : listWorkflowIds(workspaceRoot);
   const workflows = targetWorkflowIds.map((currentWorkflowId) => loadWorkflow(workspaceRoot, currentWorkflowId));
@@ -21,7 +24,10 @@ function syncSchedules({
     skillRoot,
     openclawCommand,
     openclawTimeoutMs,
+    openclawRetryCount,
+    openclawRetryDelayMs,
     runCommandFn,
+    sleepFn,
   }));
 
   return {
@@ -41,6 +47,8 @@ function main(argv = process.argv.slice(2)) {
     skillRoot: path.resolve(flags.skillRoot || path.resolve(__dirname, '..')),
     openclawCommand: flags.openclawCommand || 'openclaw',
     openclawTimeoutMs: flags.openclawTimeoutMs ? Number.parseInt(flags.openclawTimeoutMs, 10) : 30000,
+    openclawRetryCount: flags.openclawRetryCount ? Number.parseInt(flags.openclawRetryCount, 10) : undefined,
+    openclawRetryDelayMs: flags.openclawRetryDelayMs ? Number.parseInt(flags.openclawRetryDelayMs, 10) : undefined,
   });
   printJson(result);
 }

@@ -115,6 +115,61 @@ test('doctor reports warn when workflow schedules drift from OpenClaw cron', () 
   assert.equal(report.checks.some((check) => check.id === 'schedule-sync' && check.status === 'warn'), true);
 });
 
+test('doctor distinguishes gateway RPC health from operator-level scope access', () => {
+  const skillRoot = path.join(process.cwd(), 'skill-root');
+  const report = evaluateDoctorChecks({
+    skillRoot,
+    localPluginExists: true,
+    pluginInfo: {
+      enabled: true,
+      status: 'loaded',
+      commands: ['lwf'],
+      source: path.join(skillRoot, 'plugin', 'index.js'),
+    },
+    telegramPluginInfo: {
+      enabled: true,
+      status: 'loaded',
+    },
+    pluginsAllow: {
+      present: true,
+      values: ['lobster-workflows-telegram'],
+    },
+    telegramBotToken: 'telegram-bot-token',
+    globalApprovers: ['1234567890'],
+    configValidation: {
+      ok: true,
+    },
+    gatewayAccess: {
+      gatewayStatus: {
+        gateway: {
+          bindHost: '127.0.0.1',
+          port: 18789,
+          probeUrl: 'ws://127.0.0.1:18789',
+        },
+        port: {
+          listeners: [{ address: '127.0.0.1:18789' }],
+        },
+        rpc: {
+          ok: true,
+          url: 'ws://127.0.0.1:18789',
+        },
+      },
+      gatewayStatusError: null,
+      openclawStatus: {
+        gateway: {
+          reachable: false,
+          error: 'missing scope: operator.read',
+        },
+      },
+      openclawStatusError: null,
+    },
+  });
+
+  assert.equal(report.status, 'warn');
+  assert.equal(report.checks.some((check) => check.id === 'gateway-rpc' && check.status === 'ok'), true);
+  assert.equal(report.checks.some((check) => check.id === 'gateway-operator-access' && check.status === 'warn'), true);
+});
+
 test('doctor reports fail for missing plugin install and invalid config', () => {
   const skillRoot = path.join(process.cwd(), 'skill-root');
   const report = evaluateDoctorChecks({
@@ -157,6 +212,38 @@ test('doctor reports ok after schedule drift is repaired with --fix', () => {
       OPENCLAW_TELEGRAM_APPROVERS: '1234567890',
     },
     run: (command, args) => {
+      if (args[0] === 'gateway' && args[1] === 'status') {
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            gateway: {
+              bindHost: '127.0.0.1',
+              port: 18789,
+              probeUrl: 'ws://127.0.0.1:18789',
+            },
+            port: {
+              listeners: [{ address: '127.0.0.1:18789' }],
+            },
+            rpc: {
+              ok: true,
+              url: 'ws://127.0.0.1:18789',
+            },
+          }),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'status') {
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            gateway: {
+              reachable: true,
+              error: null,
+            },
+          }),
+          stderr: '',
+        };
+      }
       if (args[0] === 'plugins' && args[1] === 'info' && args[2] === 'lobster-workflows-telegram') {
         return {
           ok: true,
@@ -247,6 +334,38 @@ test('doctor reports fail when schedule drift inspection cannot reach cron state
       OPENCLAW_TELEGRAM_APPROVERS: '1234567890',
     },
     run: (command, args) => {
+      if (args[0] === 'gateway' && args[1] === 'status') {
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            gateway: {
+              bindHost: '127.0.0.1',
+              port: 18789,
+              probeUrl: 'ws://127.0.0.1:18789',
+            },
+            port: {
+              listeners: [{ address: '127.0.0.1:18789' }],
+            },
+            rpc: {
+              ok: true,
+              url: 'ws://127.0.0.1:18789',
+            },
+          }),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'status') {
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            gateway: {
+              reachable: false,
+              error: 'missing scope: operator.read',
+            },
+          }),
+          stderr: '',
+        };
+      }
       if (args[0] === 'plugins' && args[1] === 'info' && args[2] === 'lobster-workflows-telegram') {
         return {
           ok: true,
@@ -295,6 +414,8 @@ test('doctor reports fail when schedule drift inspection cannot reach cron state
 
   assert.equal(result.report.status, 'fail');
   assert.equal(result.report.checks.some((check) => check.id === 'schedule-sync' && check.status === 'fail'), true);
+  assert.equal(result.report.checks.some((check) => check.id === 'gateway-rpc' && check.status === 'ok'), true);
+  assert.equal(result.report.checks.some((check) => check.id === 'gateway-operator-access' && check.status === 'warn'), true);
 });
 
 test('doctor report formatter includes statuses and hints', () => {

@@ -202,6 +202,283 @@ test('sync-schedules edits an existing managed job when schedule still exists', 
   assert.equal(calls.some((call) => call.args.includes('--timeout') && call.args.includes('30000')), true);
 });
 
+test('sync-schedules retries transient gateway failures before listing cron jobs', () => {
+  const workspaceRoot = createTempWorkspace();
+  const scaffold = scaffoldWorkflow({
+    workspaceRoot,
+    workflowId: 'daily-report',
+    displayName: 'Daily Report',
+    description: 'Daily report workflow',
+  });
+
+  writeWorkflowConfig(scaffold.workflowRoot, `module.exports = {
+  identity: {
+    workflowId: 'daily-report',
+    displayName: 'Daily Report',
+    description: 'Daily report workflow',
+  },
+  runtime: {
+    runnerType: 'node',
+    entrypoint: 'run-workflow.js',
+    defaultAction: 'run',
+    workingDirectory: '.',
+    defaultInputs: {},
+  },
+  schedules: [
+    {
+      scheduleId: 'morning',
+      kind: 'cron',
+      cron: '0 7 * * *',
+      timezone: 'UTC',
+      enabled: true,
+    },
+  ],
+  result: {
+    resultType: 'object',
+    resultDescription: 'Canonical workflow result payload',
+    latestResultPolicy: 'on-success',
+    extractor: {
+      sourceAction: 'run',
+      dataPath: null,
+    },
+  },
+  observability: {
+    successCondition: {
+      ok: true,
+    },
+    defaultTimeoutMs: 30000,
+  },
+};
+`);
+
+  let listAttempts = 0;
+  const sleepCalls = [];
+  const runCommandFn = (command, args) => {
+    if (args[0] === 'cron' && args[1] === 'list') {
+      listAttempts += 1;
+      if (listAttempts < 3) {
+        return {
+          ok: false,
+          stdout: '',
+          stderr: 'gateway connect failed: Error: gateway closed (1000 normal closure): no close reason',
+          errorMessage: null,
+        };
+      }
+      return {
+        ok: true,
+        stdout: JSON.stringify({ jobs: [] }),
+        stderr: '',
+      };
+    }
+    if (args[0] === 'cron' && args[1] === 'add') {
+      return {
+        ok: true,
+        stdout: JSON.stringify({ jobId: 'job-new' }),
+        stderr: '',
+      };
+    }
+    throw new Error(`Unexpected command: ${command} ${args.join(' ')}`);
+  };
+
+  const result = syncSchedules({
+    workspaceRoot,
+    workflowId: 'daily-report',
+    skillRoot,
+    openclawCommand: 'openclaw',
+    openclawRetryCount: 2,
+    openclawRetryDelayMs: 5,
+    runCommandFn,
+    sleepFn: (delayMs) => sleepCalls.push(delayMs),
+  });
+
+  assert.equal(result.workflowCount, 1);
+  assert.equal(listAttempts, 3);
+  assert.deepEqual(sleepCalls, [5, 10]);
+  assert.equal(result.workflows[0].operations.some((operation) => operation.type === 'add'), true);
+});
+
+test('sync-schedules fails fast for non-transient cron list failures', () => {
+  const workspaceRoot = createTempWorkspace();
+  const scaffold = scaffoldWorkflow({
+    workspaceRoot,
+    workflowId: 'daily-report',
+    displayName: 'Daily Report',
+    description: 'Daily report workflow',
+  });
+
+  writeWorkflowConfig(scaffold.workflowRoot, `module.exports = {
+  identity: {
+    workflowId: 'daily-report',
+    displayName: 'Daily Report',
+    description: 'Daily report workflow',
+  },
+  runtime: {
+    runnerType: 'node',
+    entrypoint: 'run-workflow.js',
+    defaultAction: 'run',
+    workingDirectory: '.',
+    defaultInputs: {},
+  },
+  schedules: [
+    {
+      scheduleId: 'morning',
+      kind: 'cron',
+      cron: '0 7 * * *',
+      timezone: 'UTC',
+      enabled: true,
+    },
+  ],
+  result: {
+    resultType: 'object',
+    resultDescription: 'Canonical workflow result payload',
+    latestResultPolicy: 'on-success',
+    extractor: {
+      sourceAction: 'run',
+      dataPath: null,
+    },
+  },
+  observability: {
+    successCondition: {
+      ok: true,
+    },
+    defaultTimeoutMs: 30000,
+  },
+};
+`);
+
+  let listAttempts = 0;
+  const sleepCalls = [];
+  const runCommandFn = (command, args) => {
+    if (args[0] === 'cron' && args[1] === 'list') {
+      listAttempts += 1;
+      return {
+        ok: false,
+        stdout: '',
+        stderr: 'invalid option: --bogus',
+        errorMessage: null,
+      };
+    }
+    throw new Error(`Unexpected command: ${command} ${args.join(' ')}`);
+  };
+
+  assert.throws(() => syncSchedules({
+    workspaceRoot,
+    workflowId: 'daily-report',
+    skillRoot,
+    openclawCommand: 'openclaw',
+    openclawRetryCount: 2,
+    openclawRetryDelayMs: 5,
+    runCommandFn,
+    sleepFn: (delayMs) => sleepCalls.push(delayMs),
+  }), /Failed to list cron jobs: invalid option: --bogus/u);
+
+  assert.equal(listAttempts, 1);
+  assert.deepEqual(sleepCalls, []);
+});
+
+test('sync-schedules includes gateway diagnostics when cron list cannot reach usable gateway state', () => {
+  const workspaceRoot = createTempWorkspace();
+  const scaffold = scaffoldWorkflow({
+    workspaceRoot,
+    workflowId: 'daily-report',
+    displayName: 'Daily Report',
+    description: 'Daily report workflow',
+  });
+
+  writeWorkflowConfig(scaffold.workflowRoot, `module.exports = {
+  identity: {
+    workflowId: 'daily-report',
+    displayName: 'Daily Report',
+    description: 'Daily report workflow',
+  },
+  runtime: {
+    runnerType: 'node',
+    entrypoint: 'run-workflow.js',
+    defaultAction: 'run',
+    workingDirectory: '.',
+    defaultInputs: {},
+  },
+  schedules: [
+    {
+      scheduleId: 'morning',
+      kind: 'cron',
+      cron: '0 7 * * *',
+      timezone: 'UTC',
+      enabled: true,
+    },
+  ],
+  result: {
+    resultType: 'object',
+    resultDescription: 'Canonical workflow result payload',
+    latestResultPolicy: 'on-success',
+    extractor: {
+      sourceAction: 'run',
+      dataPath: null,
+    },
+  },
+  observability: {
+    successCondition: {
+      ok: true,
+    },
+    defaultTimeoutMs: 30000,
+  },
+};
+`);
+
+  const runCommandFn = (command, args) => {
+    if (args[0] === 'cron' && args[1] === 'list') {
+      return {
+        ok: false,
+        stdout: '',
+        stderr: 'gateway connect failed: Error: gateway closed (1000 normal closure): no close reason',
+        errorMessage: null,
+      };
+    }
+    if (args[0] === 'gateway' && args[1] === 'status') {
+      return {
+        ok: true,
+        stdout: JSON.stringify({
+          gateway: {
+            bindHost: '127.0.0.1',
+            port: 18789,
+            probeUrl: 'ws://127.0.0.1:18789',
+          },
+          port: {
+            listeners: [{ address: '127.0.0.1:18789' }],
+          },
+          rpc: {
+            ok: true,
+            url: 'ws://127.0.0.1:18789',
+          },
+        }),
+        stderr: '',
+      };
+    }
+    if (args[0] === 'status') {
+      return {
+        ok: true,
+        stdout: JSON.stringify({
+          gateway: {
+            reachable: false,
+            error: 'missing scope: operator.read',
+          },
+        }),
+        stderr: '',
+      };
+    }
+    throw new Error(`Unexpected command: ${command} ${args.join(' ')}`);
+  };
+
+  assert.throws(() => syncSchedules({
+    workspaceRoot,
+    workflowId: 'daily-report',
+    skillRoot,
+    openclawCommand: 'openclaw',
+    openclawRetryCount: 0,
+    runCommandFn,
+  }), /Gateway diagnostics: gateway RPC ok \(ws:\/\/127\.0\.0\.1:18789; listening 127\.0\.0\.1:18789\); operator-level status unavailable \(missing scope: operator\.read\)/u);
+});
+
 test('sync-schedules disables duplicate managed jobs for the same active schedule', () => {
   const workspaceRoot = createTempWorkspace();
   const scaffold = scaffoldWorkflow({
