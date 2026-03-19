@@ -848,6 +848,112 @@ function buildWorkflowSyncPlan({
   };
 }
 
+function cloneJsonValue(value) {
+  if (value == null) return null;
+  return JSON.parse(JSON.stringify(value));
+}
+
+function getLastSuccessfulSyncState(syncState) {
+  if (!syncState || typeof syncState !== 'object') return null;
+  if (!syncState.status || syncState.status === 'synced') return syncState;
+  if (syncState.lastSuccessfulState && typeof syncState.lastSuccessfulState === 'object') {
+    return syncState.lastSuccessfulState;
+  }
+  return null;
+}
+
+function summarizeSuccessfulSyncState(syncState) {
+  const successfulState = getLastSuccessfulSyncState(syncState);
+  if (!successfulState) return null;
+  return {
+    generatedAt: successfulState.generatedAt || null,
+    selectedBackend: successfulState.selectedBackend || successfulState.requestedBackend || null,
+    scheduleCount: Array.isArray(successfulState.schedules) ? successfulState.schedules.length : 0,
+  };
+}
+
+function buildPersistedSyncState({
+  workflow,
+  status,
+  requestedBackend,
+  selectedBackend,
+  backendAttempts,
+  dryRun,
+  recoveryOnly,
+  error,
+  recovery,
+  schedules,
+  operations,
+  lastSuccessfulState = null,
+}) {
+  return {
+    workflowId: workflow.workflowId,
+    generatedAt: new Date().toISOString(),
+    status,
+    requestedBackend: normalizeSyncBackend(requestedBackend),
+    selectedBackend: selectedBackend || null,
+    backendAttempts: Array.isArray(backendAttempts) ? backendAttempts : [],
+    dryRun: Boolean(dryRun),
+    recoveryOnly: Boolean(recoveryOnly),
+    error: error ? (error.message || String(error)) : null,
+    recovery: recovery || null,
+    schedules: Array.isArray(schedules) ? schedules : [],
+    operations: Array.isArray(operations) ? operations : [],
+    lastSuccessfulState: cloneJsonValue(getLastSuccessfulSyncState(lastSuccessfulState)),
+  };
+}
+
+function buildFailedSyncState({
+  workspaceRoot,
+  workflow,
+  skillRoot,
+  requestedBackend,
+  selectedBackend,
+  backendAttempts,
+  error,
+  openclawTimeoutMs,
+  schedules = [],
+  operations = [],
+  lastSuccessfulState = null,
+  status = 'failed',
+}) {
+  const lastSuccessfulSummary = summarizeSuccessfulSyncState(lastSuccessfulState);
+  return buildPersistedSyncState({
+    workflow,
+    status,
+    requestedBackend,
+    selectedBackend,
+    backendAttempts,
+    dryRun: false,
+    recoveryOnly: false,
+    error,
+    recovery: {
+      mode: status === 'partial' ? 'partial-failure' : 'retry-guidance',
+      summary: status === 'partial'
+        ? 'Schedule sync applied some cron changes before failing.'
+        : 'Schedule sync failed before it could reconcile cron state.',
+      retryCommands: buildRecoveryCommands({
+        workflow,
+        skillRoot,
+        workspaceRoot,
+        openclawTimeoutMs,
+      }),
+      lastSyncState: lastSuccessfulSummary,
+      caveats: status === 'partial'
+        ? [
+          'Some operations completed before the failure. Review live cron state before retrying.',
+          'The lastSuccessfulState snapshot reflects the previous confirmed sync, not this partial attempt.',
+        ]
+        : [
+          'No successful sync completion was recorded for this attempt.',
+        ],
+    },
+    schedules,
+    operations,
+    lastSuccessfulState,
+  });
+}
+
 function isRecoverableSyncFailure(error) {
   const details = String(error?.message || error || '').toLowerCase();
   if (!details) return false;
@@ -911,7 +1017,8 @@ function buildRecoveryCommands({
 }
 
 function buildSnapshotJobsFromSyncState(workflow, syncState) {
-  return (Array.isArray(syncState?.schedules) ? syncState.schedules : [])
+  const successfulState = getLastSuccessfulSyncState(syncState);
+  return (Array.isArray(successfulState?.schedules) ? successfulState.schedules : [])
     .map((entry) => ({
       id: entry?.jobId || null,
       jobId: entry?.jobId || null,
@@ -932,24 +1039,25 @@ function buildRecoveryState({
   openclawTimeoutMs,
 }) {
   const lastSyncState = readSyncState(workspaceRoot, workflow.workflowId);
+  const lastSuccessfulState = getLastSuccessfulSyncState(lastSyncState);
   const recoveryCommands = buildRecoveryCommands({
     workflow,
     skillRoot,
     workspaceRoot,
     openclawTimeoutMs,
   });
-  const state = {
-    workflowId: workflow.workflowId,
-    generatedAt: new Date().toISOString(),
+  const state = buildPersistedSyncState({
+    workflow,
     status: 'recovery-only',
-    requestedBackend: normalizeSyncBackend(requestedBackend),
+    requestedBackend,
     selectedBackend: null,
-    backendAttempts: Array.isArray(backendAttempts) ? backendAttempts : [],
+    backendAttempts,
     dryRun: true,
     recoveryOnly: true,
-    error: error.message || String(error),
+    error,
     schedules: [],
     operations: [],
+    lastSuccessfulState,
     recovery: {
       mode: 'retry-guidance',
       summary: 'Live OpenClaw cron state could not be reached. No cron changes were applied.',
@@ -960,9 +1068,9 @@ function buildRecoveryState({
         'No cron mutation happened in this recovery-only result.',
       ],
     },
-  };
+  });
 
-  if (!lastSyncState) {
+  if (!lastSuccessfulState) {
     state.recovery.caveats.push('No previous sync snapshot was available, so no remediation plan could be derived.');
     return state;
   }
@@ -983,11 +1091,7 @@ function buildRecoveryState({
     mode: 'sync-state-dry-run',
     summary: 'Live OpenClaw cron state could not be reached. Returned a best-effort dry-run plan derived from the last successful sync snapshot.',
     retryCommands: recoveryCommands,
-    lastSyncState: {
-      generatedAt: lastSyncState.generatedAt || null,
-      selectedBackend: lastSyncState.selectedBackend || lastSyncState.requestedBackend || null,
-      scheduleCount: Array.isArray(lastSyncState.schedules) ? lastSyncState.schedules.length : 0,
-    },
+    lastSyncState: summarizeSuccessfulSyncState(lastSuccessfulState),
     caveats: [
       'Review the remediation commands before applying them because the plan is based on the last sync snapshot, not live cron state.',
       'No cron mutation happened in this recovery-only result.',
@@ -1005,9 +1109,11 @@ function recoverSyncFailure({
   error,
   openclawCommand,
   openclawTimeoutMs,
+  persistState = true,
 }) {
+  if (error?.syncState) return null;
   if (!isRecoverableSyncFailure(error)) return null;
-  return buildRecoveryState({
+  const state = buildRecoveryState({
     workspaceRoot,
     workflow,
     skillRoot,
@@ -1017,6 +1123,14 @@ function recoverSyncFailure({
     openclawCommand,
     openclawTimeoutMs,
   });
+  if (persistState) {
+    writeSyncState({
+      workspaceRoot,
+      workflowId: workflow.workflowId,
+      state,
+    });
+  }
+  return state;
 }
 
 function buildOperationFailurePrefix({ workflow, operation, backend }) {
@@ -1165,6 +1279,7 @@ function syncWorkflowSchedulesWithBackend({
   sleepFn = sleepSync,
 }) {
   const normalizedBackend = normalizeSyncBackend(selectedBackend);
+  const previousSyncState = readSyncState(workspaceRoot, workflow.workflowId);
   const listResult = listCronJobsResolved({
     workspaceRoot,
     openclawCommand,
@@ -1187,41 +1302,66 @@ function syncWorkflowSchedulesWithBackend({
 
   if (!dryRun) {
     for (const operation of plan.operations) {
-      const execution = executePlannedOperation({
-        workspaceRoot,
-        workflow,
-        operation,
-        selectedBackend: normalizedBackend,
-        openclawCommand,
-        openclawTimeoutMs,
-        runCommandFn,
-        openclawRetryCount,
-        openclawRetryDelayMs,
-        sleepFn,
-      });
-      operation.applied = true;
-      if (operation.type === 'add' && execution.jobId) {
-        operation.jobId = execution.jobId;
-        const syncedSchedule = plan.syncedSchedules.find((entry) => entry.scheduleId === operation.scheduleId);
-        if (syncedSchedule) syncedSchedule.jobId = execution.jobId;
+      try {
+        const execution = executePlannedOperation({
+          workspaceRoot,
+          workflow,
+          operation,
+          selectedBackend: normalizedBackend,
+          openclawCommand,
+          openclawTimeoutMs,
+          runCommandFn,
+          openclawRetryCount,
+          openclawRetryDelayMs,
+          sleepFn,
+        });
+        operation.applied = true;
+        if (operation.type === 'add' && execution.jobId) {
+          operation.jobId = execution.jobId;
+          const syncedSchedule = plan.syncedSchedules.find((entry) => entry.scheduleId === operation.scheduleId);
+          if (syncedSchedule) syncedSchedule.jobId = execution.jobId;
+        }
+      } catch (error) {
+        const appliedOperationCount = plan.operations.filter((entry) => entry.applied === true).length;
+        const failedState = buildFailedSyncState({
+          workspaceRoot,
+          workflow,
+          skillRoot,
+          requestedBackend,
+          selectedBackend: listResult.selectedBackend || normalizedBackend,
+          backendAttempts: listResult.backendAttempts || [{ backend: normalizedBackend, ok: true }],
+          error,
+          openclawTimeoutMs,
+          schedules: plan.syncedSchedules,
+          operations: plan.operations,
+          lastSuccessfulState: previousSyncState,
+          status: appliedOperationCount > 0 ? 'partial' : 'failed',
+        });
+        writeSyncState({
+          workspaceRoot,
+          workflowId: workflow.workflowId,
+          state: failedState,
+        });
+        error.syncState = failedState;
+        throw error;
       }
     }
   }
 
-  const state = {
-    workflowId: workflow.workflowId,
-    generatedAt: new Date().toISOString(),
+  const state = buildPersistedSyncState({
+    workflow,
     status: dryRun ? 'dry-run' : 'synced',
-    requestedBackend: normalizeSyncBackend(requestedBackend),
+    requestedBackend,
     selectedBackend: listResult.selectedBackend || normalizedBackend,
     backendAttempts: listResult.backendAttempts || [{ backend: normalizedBackend, ok: true }],
-    dryRun: Boolean(dryRun),
+    dryRun,
     recoveryOnly: false,
     error: null,
     recovery: null,
     schedules: plan.syncedSchedules,
     operations: plan.operations,
-  };
+    lastSuccessfulState: null,
+  });
 
   if (!dryRun) {
     writeSyncState({
@@ -1423,8 +1563,34 @@ function syncWorkflowSchedules({
         error: backendError,
         openclawCommand,
         openclawTimeoutMs,
+        persistState: !dryRun,
       });
       if (recovered) return recovered;
+      if (backendError?.syncState) throw backendError;
+      if (!dryRun) {
+        writeSyncState({
+          workspaceRoot,
+          workflowId: workflow.workflowId,
+          state: buildFailedSyncState({
+            workspaceRoot,
+            workflow,
+            skillRoot,
+            requestedBackend: normalizedBackend,
+            selectedBackend: normalizedBackend,
+            backendAttempts: [{
+              backend: normalizedBackend,
+              ok: false,
+              error: backendError.message || String(backendError),
+            }],
+            error: backendError,
+            openclawTimeoutMs,
+            schedules: [],
+            operations: backendError?.syncState?.operations || [],
+            lastSuccessfulState: readSyncState(workspaceRoot, workflow.workflowId),
+            status: backendError?.syncState?.status === 'partial' ? 'partial' : 'failed',
+          }),
+        });
+      }
       throw backendError;
     }
   }
@@ -1489,8 +1655,30 @@ function syncWorkflowSchedules({
         error: combined,
         openclawCommand,
         openclawTimeoutMs,
+        persistState: !dryRun,
       });
       if (recovered) return recovered;
+      if (combined?.syncState) throw combined;
+      if (!dryRun) {
+        writeSyncState({
+          workspaceRoot,
+          workflowId: workflow.workflowId,
+          state: buildFailedSyncState({
+            workspaceRoot,
+            workflow,
+            skillRoot,
+            requestedBackend: 'auto',
+            selectedBackend: null,
+            backendAttempts: combined.backendAttempts,
+            error: combined,
+            openclawTimeoutMs,
+            schedules: [],
+            operations: combined?.syncState?.operations || [],
+            lastSuccessfulState: readSyncState(workspaceRoot, workflow.workflowId),
+            status: combined?.syncState?.status === 'partial' ? 'partial' : 'failed',
+          }),
+        });
+      }
       throw combined;
     }
   }

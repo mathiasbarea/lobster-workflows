@@ -607,6 +607,11 @@ test('sync-schedules fails fast for non-transient cron list failures', () => {
 
   assert.equal(listAttempts, 1);
   assert.deepEqual(sleepCalls, []);
+  const failedState = readSyncState(workspaceRoot, 'daily-report');
+  assert.equal(failedState?.status, 'failed');
+  assert.equal(failedState?.recoveryOnly, false);
+  assert.match(failedState?.error || '', /invalid option: --bogus/u);
+  assert.equal(failedState?.lastSuccessfulState, null);
 });
 
 test('sync-schedules includes gateway diagnostics when cron list cannot reach usable gateway state', () => {
@@ -716,6 +721,10 @@ test('sync-schedules includes gateway diagnostics when cron list cannot reach us
   assert.match(result.workflows[0].error, /Gateway diagnostics: gateway RPC ok \(ws:\/\/127\.0\.0\.1:18789; listening 127\.0\.0\.1:18789\); operator-level status unavailable \(missing scope: operator\.read\)/u);
   assert.equal(result.workflows[0].operations.length, 0);
   assert.equal(result.workflows[0].recovery?.mode, 'retry-guidance');
+  const persistedState = readSyncState(workspaceRoot, 'daily-report');
+  assert.equal(persistedState?.status, 'recovery-only');
+  assert.equal(persistedState?.recoveryOnly, true);
+  assert.equal(persistedState?.lastSuccessfulState, null);
 });
 
 test('sync-schedules dry-run returns planned operations and remediation without mutating sync state', () => {
@@ -937,7 +946,150 @@ test('sync-schedules returns recovery-only remediation from the last sync state 
   assert.equal(workflowResult.recovery?.lastSyncState?.generatedAt, '2026-03-18T22:30:00.000Z');
   assert.equal(workflowResult.recovery?.retryCommands?.some((command) => command.label === 'retry-gateway'), true);
   assert.match(workflowResult.error, /Failed to list cron jobs via cli backend/u);
-  assert.deepEqual(readSyncState(workspaceRoot, 'daily-report'), previousState);
+  const persistedState = readSyncState(workspaceRoot, 'daily-report');
+  assert.equal(persistedState?.status, 'recovery-only');
+  assert.equal(persistedState?.recoveryOnly, true);
+  assert.equal(persistedState?.recovery?.mode, 'sync-state-dry-run');
+  assert.deepEqual(persistedState?.lastSuccessfulState, previousState);
+});
+
+test('sync-schedules persists partial state when an operation fails after earlier cron changes were applied', () => {
+  const workspaceRoot = createTempWorkspace();
+  const scaffold = scaffoldWorkflow({
+    workspaceRoot,
+    workflowId: 'daily-report',
+    displayName: 'Daily Report',
+    description: 'Daily report workflow',
+  });
+
+  writeWorkflowConfig(scaffold.workflowRoot, `module.exports = {
+  identity: {
+    workflowId: 'daily-report',
+    displayName: 'Daily Report',
+    description: 'Daily report workflow',
+  },
+  runtime: {
+    runnerType: 'node',
+    entrypoint: 'run-workflow.js',
+    defaultAction: 'run',
+    workingDirectory: '.',
+    defaultInputs: {},
+  },
+  schedules: [
+    {
+      scheduleId: 'morning',
+      kind: 'cron',
+      cron: '0 7 * * *',
+      timezone: 'UTC',
+      enabled: true,
+    },
+    {
+      scheduleId: 'night',
+      kind: 'cron',
+      cron: '0 23 * * *',
+      timezone: 'UTC',
+      enabled: true,
+    },
+  ],
+  result: {
+    resultType: 'object',
+    resultDescription: 'Canonical workflow result payload',
+    latestResultPolicy: 'on-success',
+    extractor: {
+      sourceAction: 'run',
+      dataPath: null,
+    },
+  },
+  observability: {
+    successCondition: {
+      ok: true,
+    },
+    defaultTimeoutMs: 30000,
+  },
+};
+`);
+
+  const calls = [];
+  const runCommandFn = (command, args) => {
+    calls.push({ command, args });
+    if (args[0] === 'cron' && args[1] === 'list') {
+      return {
+        ok: true,
+        stdout: JSON.stringify({ jobs: [] }),
+        stderr: '',
+      };
+    }
+    if (args[0] === 'cron' && args[1] === 'add' && args.includes('lobster-workflows::daily-report::morning')) {
+      return {
+        ok: true,
+        stdout: JSON.stringify({ jobId: 'job-morning' }),
+        stderr: '',
+      };
+    }
+    if (args[0] === 'cron' && args[1] === 'add' && args.includes('lobster-workflows::daily-report::night')) {
+      return {
+        ok: false,
+        stdout: '',
+        stderr: 'gateway connect failed: Error: gateway closed (1000 normal closure): no close reason',
+        errorMessage: null,
+      };
+    }
+    if (args[0] === 'gateway' && args[1] === 'status') {
+      return {
+        ok: true,
+        stdout: JSON.stringify({
+          gateway: {
+            bindHost: '127.0.0.1',
+            port: 18789,
+            probeUrl: 'ws://127.0.0.1:18789',
+          },
+          port: {
+            listeners: [{ address: '127.0.0.1:18789' }],
+          },
+          rpc: {
+            ok: true,
+            url: 'ws://127.0.0.1:18789',
+          },
+        }),
+        stderr: '',
+      };
+    }
+    if (args[0] === 'status') {
+      return {
+        ok: true,
+        stdout: JSON.stringify({
+          gateway: {
+            reachable: false,
+            error: 'missing scope: operator.read',
+          },
+        }),
+        stderr: '',
+      };
+    }
+    throw new Error(`Unexpected command: ${command} ${args.join(' ')}`);
+  };
+
+  assert.throws(() => syncSchedules({
+    workspaceRoot,
+    workflowId: 'daily-report',
+    skillRoot,
+    syncBackend: 'cli',
+    openclawCommand: 'openclaw',
+    openclawRetryCount: 0,
+    runCommandFn,
+  }), /Failed to add cron job for daily-report\/night via cli backend/u);
+
+  const partialState = readSyncState(workspaceRoot, 'daily-report');
+  assert.equal(partialState?.status, 'partial');
+  assert.equal(partialState?.recoveryOnly, false);
+  assert.equal(partialState?.operations?.[0]?.scheduleId, 'morning');
+  assert.equal(partialState?.operations?.[0]?.applied, true);
+  assert.equal(partialState?.operations?.[1]?.scheduleId, 'night');
+  assert.equal(partialState?.operations?.[1]?.applied, false);
+  assert.equal(partialState?.recovery?.mode, 'partial-failure');
+  assert.equal(partialState?.lastSuccessfulState, null);
+  assert.equal(calls.some((call) => call.args.includes('lobster-workflows::daily-report::morning')), true);
+  assert.equal(calls.some((call) => call.args.includes('lobster-workflows::daily-report::night')), true);
 });
 
 test('sync-schedules disables duplicate managed jobs for the same active schedule', () => {
