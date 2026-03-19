@@ -25,6 +25,33 @@ function parseCronAddJson(stdout) {
   return parsed.jobId || parsed.id || parsed?.job?.jobId || parsed?.job?.id || parsed?.result?.jobId || parsed?.result?.id || null;
 }
 
+function parseDurationMs(input) {
+  const raw = String(input || '').trim();
+  if (!raw) return null;
+  const match = raw.match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/i);
+  if (!match) return null;
+  const quantity = Number.parseFloat(match[1] || '');
+  if (!Number.isFinite(quantity) || quantity <= 0) return null;
+  const unit = String(match[2] || '').toLowerCase();
+  const factor = unit === 'ms' ? 1
+    : unit === 's' ? 1000
+      : unit === 'm' ? 60 * 1000
+        : unit === 'h' ? 60 * 60 * 1000
+          : 24 * 60 * 60 * 1000;
+  return Math.floor(quantity * factor);
+}
+
+function isScheduleActive(schedule) {
+  return Boolean(schedule) && schedule.enabled !== false && schedule.enabledByDefault !== false;
+}
+
+function parseManagedScheduleId(jobName, workflowId) {
+  const prefix = `${MANAGED_PREFIX}${workflowId}::`;
+  const normalized = String(jobName || '');
+  if (!normalized.startsWith(prefix)) return null;
+  return normalized.slice(prefix.length);
+}
+
 function buildCronMessage({ skillRoot, workspaceRoot, workflowId, scheduleId }) {
   const scriptPath = normalizePath(path.join(skillRoot, 'scripts', 'run-workflow.js'));
   return [
@@ -145,17 +172,20 @@ function runOpenclawCommand({
   });
 }
 
-function syncWorkflowSchedules({
+function listCronJobs({
   workspaceRoot,
-  workflow,
-  skillRoot,
   openclawCommand = 'openclaw',
   openclawTimeoutMs = 30000,
+  includeDisabled = true,
   runCommandFn = runCommand,
 }) {
+  const args = ['cron', 'list'];
+  if (includeDisabled) args.push('--all');
+  args.push('--json', '--timeout', String(openclawTimeoutMs));
+
   const listResult = runOpenclawCommand({
     openclawCommand,
-    args: ['cron', 'list', '--all', '--json', '--timeout', String(openclawTimeoutMs)],
+    args,
     workspaceRoot,
     openclawTimeoutMs,
     runCommandFn,
@@ -164,15 +194,178 @@ function syncWorkflowSchedules({
     throw new Error(`Failed to list cron jobs: ${listResult.stderr || listResult.errorMessage || 'unknown error'}`);
   }
 
-  const jobs = parseCronListJson(listResult.stdout);
+  return parseCronListJson(listResult.stdout);
+}
+
+function buildExpectedManagedJob({ workflow, schedule, skillRoot, workspaceRoot }) {
+  const timeoutSeconds = Math.max(1, Math.ceil((workflow.config.observability?.defaultTimeoutMs || 30000) / 1000));
+  const expected = {
+    name: getManagedJobName(workflow.workflowId, schedule.scheduleId),
+    description: schedule.description || `${workflow.workflowId}:${schedule.scheduleId}`,
+    enabled: true,
+    sessionTarget: 'isolated',
+    payload: {
+      kind: 'agentTurn',
+      message: buildCronMessage({
+        skillRoot,
+        workspaceRoot,
+        workflowId: workflow.workflowId,
+        scheduleId: schedule.scheduleId,
+      }),
+      timeoutSeconds,
+    },
+    schedule: {
+      kind: schedule.kind,
+    },
+  };
+
+  if (schedule.kind === 'cron') {
+    expected.schedule.expr = schedule.cron;
+    if (schedule.timezone) expected.schedule.tz = schedule.timezone;
+    const staggerMs = schedule.exact ? 0 : parseDurationMs(schedule.stagger);
+    if (staggerMs !== null) expected.schedule.staggerMs = staggerMs;
+  } else if (schedule.kind === 'every') {
+    expected.schedule.everyMs = parseDurationMs(schedule.every);
+  } else if (schedule.kind === 'at') {
+    const parsedAtMs = Date.parse(String(schedule.at || '').trim());
+    expected.schedule.at = Number.isNaN(parsedAtMs) ? String(schedule.at || '').trim() : new Date(parsedAtMs).toISOString();
+    expected.deleteAfterRun = schedule.deleteAfterRun !== false;
+  }
+
+  return expected;
+}
+
+function compareManagedJobs(actual, expected) {
+  const mismatches = [];
+
+  if (String(actual?.name || '') !== String(expected.name || '')) mismatches.push('name');
+  if (String(actual?.description || '') !== String(expected.description || '')) mismatches.push('description');
+  if (Boolean(actual?.enabled) !== Boolean(expected.enabled)) mismatches.push('enabled');
+  if (String(actual?.sessionTarget || '') !== String(expected.sessionTarget || '')) mismatches.push('sessionTarget');
+  if (String(actual?.payload?.kind || '') !== String(expected.payload?.kind || '')) mismatches.push('payload.kind');
+  if (String(actual?.payload?.message || '') !== String(expected.payload?.message || '')) mismatches.push('payload.message');
+  if (Number(actual?.payload?.timeoutSeconds || 0) !== Number(expected.payload?.timeoutSeconds || 0)) mismatches.push('payload.timeoutSeconds');
+  if (String(actual?.schedule?.kind || '') !== String(expected.schedule?.kind || '')) mismatches.push('schedule.kind');
+
+  const kind = expected.schedule?.kind;
+  if (kind === 'cron') {
+    if (String(actual?.schedule?.expr || '') !== String(expected.schedule?.expr || '')) mismatches.push('schedule.expr');
+    if (String(actual?.schedule?.tz || '') !== String(expected.schedule?.tz || '')) mismatches.push('schedule.tz');
+    const actualStagger = actual?.schedule?.staggerMs;
+    const expectedStagger = expected.schedule?.staggerMs;
+    if (actualStagger !== expectedStagger) mismatches.push('schedule.staggerMs');
+  } else if (kind === 'every') {
+    if (Number(actual?.schedule?.everyMs || 0) !== Number(expected.schedule?.everyMs || 0)) mismatches.push('schedule.everyMs');
+  } else if (kind === 'at') {
+    if (String(actual?.schedule?.at || '') !== String(expected.schedule?.at || '')) mismatches.push('schedule.at');
+    if (Boolean(actual?.deleteAfterRun) !== Boolean(expected.deleteAfterRun)) mismatches.push('deleteAfterRun');
+  }
+
+  return mismatches;
+}
+
+function inspectWorkflowScheduleSync({
+  workspaceRoot,
+  workflow,
+  skillRoot,
+  jobs,
+}) {
+  const managedJobs = jobs.filter((job) => String(job?.name || '').startsWith(`${MANAGED_PREFIX}${workflow.workflowId}::`));
+  const activeSchedules = (workflow.config.schedules || []).filter(isScheduleActive);
+  const activeScheduleIds = new Set(activeSchedules.map((schedule) => schedule.scheduleId));
+  const drift = [];
+
+  for (const schedule of activeSchedules) {
+    const expected = buildExpectedManagedJob({
+      workflow,
+      schedule,
+      skillRoot,
+      workspaceRoot,
+    });
+    const matchingJobs = managedJobs.filter((job) => String(job?.name || '') === expected.name);
+    if (matchingJobs.length === 0) {
+      drift.push({
+        type: 'missing-active-job',
+        scheduleId: schedule.scheduleId,
+        expectedJobName: expected.name,
+      });
+      continue;
+    }
+
+    const enabledMatches = matchingJobs.filter((job) => job?.enabled !== false);
+    if (enabledMatches.length > 1) {
+      drift.push({
+        type: 'duplicate-enabled-jobs',
+        scheduleId: schedule.scheduleId,
+        jobIds: enabledMatches.map((job) => job.id || job.jobId).filter(Boolean),
+      });
+    }
+
+    const primaryJob = enabledMatches[0] || matchingJobs[0];
+    if (primaryJob?.enabled === false) {
+      drift.push({
+        type: 'disabled-active-job',
+        scheduleId: schedule.scheduleId,
+        jobId: primaryJob.id || primaryJob.jobId || null,
+      });
+    }
+
+    const mismatches = compareManagedJobs(primaryJob, expected);
+    if (mismatches.length > 0) {
+      drift.push({
+        type: 'mismatched-job',
+        scheduleId: schedule.scheduleId,
+        jobId: primaryJob.id || primaryJob.jobId || null,
+        fields: mismatches,
+      });
+    }
+  }
+
+  for (const job of managedJobs) {
+    const scheduleId = parseManagedScheduleId(job?.name, workflow.workflowId);
+    if (!scheduleId) continue;
+    if (activeScheduleIds.has(scheduleId)) continue;
+    if (job?.enabled === false) continue;
+    drift.push({
+      type: 'unexpected-enabled-job',
+      scheduleId,
+      jobId: job.id || job.jobId || null,
+    });
+  }
+
+  return {
+    workflowId: workflow.workflowId,
+    activeScheduleCount: activeSchedules.length,
+    managedJobCount: managedJobs.length,
+    drift,
+    inSync: drift.length === 0,
+  };
+}
+
+function syncWorkflowSchedules({
+  workspaceRoot,
+  workflow,
+  skillRoot,
+  openclawCommand = 'openclaw',
+  openclawTimeoutMs = 30000,
+  runCommandFn = runCommand,
+}) {
+  const jobs = listCronJobs({
+    workspaceRoot,
+    openclawCommand,
+    openclawTimeoutMs,
+    includeDisabled: true,
+    runCommandFn,
+  });
   const existingManagedJobs = jobs.filter((job) => String(job.name || '').startsWith(`${MANAGED_PREFIX}${workflow.workflowId}::`));
-  const activeSchedules = (workflow.config.schedules || []).filter((schedule) => schedule.enabled !== false && schedule.enabledByDefault !== false);
+  const activeSchedules = (workflow.config.schedules || []).filter(isScheduleActive);
   const operations = [];
   const syncedSchedules = [];
 
   for (const schedule of activeSchedules) {
     const name = getManagedJobName(workflow.workflowId, schedule.scheduleId);
-    const existingJob = existingManagedJobs.find((job) => job.name === name);
+    const matchingJobs = existingManagedJobs.filter((job) => job.name === name);
+    const existingJob = matchingJobs.find((job) => job.enabled !== false) || matchingJobs[0] || null;
     if (!existingJob) {
       const addArgs = ['cron', 'add', ...buildCommonJobArgs({ workflow, schedule, skillRoot, workspaceRoot })];
       appendScheduleArgs(addArgs, schedule);
@@ -209,6 +402,23 @@ function syncWorkflowSchedules({
     }
     operations.push({ type: 'edit', scheduleId: schedule.scheduleId, jobId: existingJob.id || existingJob.jobId });
     syncedSchedules.push({ scheduleId: schedule.scheduleId, jobId: existingJob.id || existingJob.jobId, jobName: name, enabled: true });
+
+    for (const duplicateJob of matchingJobs) {
+      const duplicateJobId = duplicateJob.id || duplicateJob.jobId;
+      const primaryJobId = existingJob.id || existingJob.jobId;
+      if (!duplicateJobId || duplicateJobId === primaryJobId || duplicateJob.enabled === false) continue;
+      const duplicateDisableResult = runOpenclawCommand({
+        openclawCommand,
+        args: ['cron', 'disable', duplicateJobId, '--timeout', String(openclawTimeoutMs)],
+        workspaceRoot,
+        openclawTimeoutMs,
+        runCommandFn,
+      });
+      if (!duplicateDisableResult.ok) {
+        throw new Error(`Failed to disable duplicate cron job ${duplicateJobId} for ${workflow.workflowId}/${schedule.scheduleId}`);
+      }
+      operations.push({ type: 'disable-duplicate', scheduleId: schedule.scheduleId, jobId: duplicateJobId });
+    }
   }
 
   const activeScheduleIds = new Set(activeSchedules.map((schedule) => schedule.scheduleId));
@@ -245,6 +455,14 @@ function syncWorkflowSchedules({
 module.exports = {
   MANAGED_PREFIX,
   buildCronMessage,
+  buildExpectedManagedJob,
+  compareManagedJobs,
   getManagedJobName,
+  inspectWorkflowScheduleSync,
+  isScheduleActive,
+  listCronJobs,
+  parseCronListJson,
+  parseDurationMs,
+  parseManagedScheduleId,
   syncWorkflowSchedules,
 };

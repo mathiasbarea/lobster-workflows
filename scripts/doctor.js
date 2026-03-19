@@ -1,14 +1,22 @@
 #!/usr/bin/env node
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
+const { parseArgs } = require('./_lib');
 const {
   getTelegramBotToken,
   parseJsonFromMixedStdout,
   resolveTelegramApprovers,
 } = require('./lib/approval-utils');
+const {
+  inspectWorkflowScheduleSync,
+  listCronJobs,
+} = require('./lib/cron-sync');
 const { runCommand } = require('./lib/process-utils');
+const { syncSchedules } = require('./sync-schedules');
+const { listWorkflowIds, loadWorkflow } = require('./lib/workflow-loader');
 const {
   PLUGIN_ID,
   isMissingConfigPath,
@@ -53,6 +61,43 @@ function parseJsonCommandOutput(step, result) {
   }
 
   return parsed;
+}
+
+function resolveOpenClawHome(env = process.env) {
+  const explicitHome = String(env.OPENCLAW_HOME || env.CODEX_HOME || '').trim();
+  if (explicitHome) return explicitHome;
+
+  const userHome = env.HOME || env.USERPROFILE || os.homedir();
+  if (!userHome) return null;
+  return path.join(userHome, '.openclaw');
+}
+
+function readOpenClawConfigFallback(env = process.env) {
+  try {
+    const openClawHome = resolveOpenClawHome(env);
+    if (!openClawHome) return null;
+    const configPath = path.join(openClawHome, 'openclaw.json');
+    if (!fs.existsSync(configPath)) return null;
+    return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function resolveWorkspaceRoot({ requestedWorkspaceRoot = null, pluginInfo = null, env = process.env }) {
+  const explicit = String(requestedWorkspaceRoot || '').trim();
+  if (explicit) return path.resolve(explicit);
+
+  const pluginWorkspace = String(pluginInfo?.workspaceDir || '').trim();
+  if (pluginWorkspace) return path.resolve(pluginWorkspace);
+
+  const config = readOpenClawConfigFallback(env) || {};
+  const configuredWorkspace = String(config?.agents?.defaults?.workspace || '').trim();
+  if (configuredWorkspace) return path.resolve(configuredWorkspace);
+
+  const openClawHome = resolveOpenClawHome(env);
+  if (!openClawHome) return null;
+  return path.join(openClawHome, 'workspace');
 }
 
 function loadPluginInfo(pluginId, { cwd, env, run = runCommand }) {
@@ -101,8 +146,156 @@ function validateOpenClawConfig({ cwd, env, run = runCommand }) {
   };
 }
 
+function formatScheduleDriftEntry(entry) {
+  if (!entry || typeof entry !== 'object') return 'Unknown schedule drift';
+  const scheduleId = entry.scheduleId ? String(entry.scheduleId) : 'unknown-schedule';
+  if (entry.type === 'missing-active-job') {
+    return `${scheduleId}: missing managed cron job`;
+  }
+  if (entry.type === 'disabled-active-job') {
+    return `${scheduleId}: managed cron job exists but is disabled`;
+  }
+  if (entry.type === 'duplicate-enabled-jobs') {
+    const jobIds = Array.isArray(entry.jobIds) && entry.jobIds.length > 0 ? ` (${entry.jobIds.join(', ')})` : '';
+    return `${scheduleId}: multiple enabled managed cron jobs${jobIds}`;
+  }
+  if (entry.type === 'unexpected-enabled-job') {
+    const jobId = entry.jobId ? ` (${entry.jobId})` : '';
+    return `${scheduleId}: enabled managed cron job exists without an active schedule${jobId}`;
+  }
+  if (entry.type === 'mismatched-job') {
+    const fields = Array.isArray(entry.fields) && entry.fields.length > 0 ? ` [${entry.fields.join(', ')}]` : '';
+    return `${scheduleId}: managed cron job differs from workflow config${fields}`;
+  }
+  return `${scheduleId}: ${entry.type}`;
+}
+
+function summarizeScheduleDrift(drifts, maxEntries = 4) {
+  const entries = (Array.isArray(drifts) ? drifts : [])
+    .slice(0, maxEntries)
+    .map(formatScheduleDriftEntry);
+  if (entries.length === 0) return '';
+  const suffix = drifts.length > maxEntries ? `; +${drifts.length - maxEntries} more` : '';
+  return `${entries.join('; ')}${suffix}`;
+}
+
+function inspectScheduleSync({
+  skillRoot,
+  workspaceRoot,
+  workflowId = null,
+  env = process.env,
+  run = runCommand,
+  openclawCommand = env.LOBSTER_WORKFLOWS_OPENCLAW_BIN || 'openclaw',
+  openclawTimeoutMs = 30000,
+  listWorkflowIdsFn = listWorkflowIds,
+  loadWorkflowFn = loadWorkflow,
+  listCronJobsFn = listCronJobs,
+}) {
+  if (!workspaceRoot) {
+    return {
+      skipped: true,
+      workspaceRoot: null,
+      workflowCount: 0,
+      inspections: [],
+      driftedWorkflows: [],
+      skipReason: 'Workspace root could not be resolved.',
+    };
+  }
+
+  const resolvedWorkspaceRoot = path.resolve(workspaceRoot);
+  if (!fs.existsSync(resolvedWorkspaceRoot)) {
+    return {
+      skipped: true,
+      workspaceRoot: resolvedWorkspaceRoot,
+      workflowCount: 0,
+      inspections: [],
+      driftedWorkflows: [],
+      skipReason: `Workspace root does not exist: ${resolvedWorkspaceRoot}`,
+    };
+  }
+
+  const targetWorkflowIds = workflowId ? [workflowId] : listWorkflowIdsFn(resolvedWorkspaceRoot);
+  if (targetWorkflowIds.length === 0) {
+    return {
+      skipped: false,
+      workspaceRoot: resolvedWorkspaceRoot,
+      workflowCount: 0,
+      inspections: [],
+      driftedWorkflows: [],
+      inSync: true,
+    };
+  }
+
+  const workflows = targetWorkflowIds.map((currentWorkflowId) => loadWorkflowFn(resolvedWorkspaceRoot, currentWorkflowId));
+  const jobs = listCronJobsFn({
+    workspaceRoot: resolvedWorkspaceRoot,
+    openclawCommand,
+    openclawTimeoutMs,
+    includeDisabled: true,
+    runCommandFn: run,
+  });
+  const inspections = workflows.map((workflow) => inspectWorkflowScheduleSync({
+    workspaceRoot: resolvedWorkspaceRoot,
+    workflow,
+    skillRoot,
+    jobs,
+  }));
+  const driftedWorkflows = inspections.filter((inspection) => !inspection.inSync);
+
+  return {
+    skipped: false,
+    workspaceRoot: resolvedWorkspaceRoot,
+    workflowCount: inspections.length,
+    inspections,
+    driftedWorkflows,
+    inSync: driftedWorkflows.length === 0,
+  };
+}
+
+function applyScheduleSyncFixes({
+  skillRoot,
+  workspaceRoot,
+  workflowIds,
+  env = process.env,
+  run = runCommand,
+  openclawCommand = env.LOBSTER_WORKFLOWS_OPENCLAW_BIN || 'openclaw',
+  openclawTimeoutMs = 30000,
+  syncSchedulesFn = syncSchedules,
+}) {
+  const applied = [];
+  const errors = [];
+
+  for (const workflowId of [...new Set((Array.isArray(workflowIds) ? workflowIds : []).filter(Boolean))]) {
+    try {
+      const result = syncSchedulesFn({
+        workspaceRoot,
+        workflowId,
+        skillRoot,
+        openclawCommand,
+        openclawTimeoutMs,
+        runCommandFn: run,
+      });
+      applied.push({
+        workflowId,
+        operations: result.workflows?.[0]?.operations || [],
+      });
+    } catch (error) {
+      errors.push({
+        workflowId,
+        error: error.message || String(error),
+      });
+    }
+  }
+
+  return {
+    applied,
+    errors,
+  };
+}
+
 function evaluateDoctorChecks({
   skillRoot,
+  workspaceRoot = null,
   localPluginExists,
   pluginInfo,
   pluginInfoError = null,
@@ -113,6 +306,7 @@ function evaluateDoctorChecks({
   telegramBotToken,
   globalApprovers,
   configValidation,
+  scheduleSync = null,
 }) {
   const checks = [];
   const expectedPluginSource = path.join(skillRoot, 'plugin', 'index.js');
@@ -231,6 +425,55 @@ function evaluateDoctorChecks({
     ));
   }
 
+  if (scheduleSync?.error) {
+    checks.push(createCheck(
+      'schedule-sync',
+      'fail',
+      scheduleSync.error,
+      'Make sure the OpenClaw gateway is reachable, then rerun the doctor.',
+    ));
+  } else if (scheduleSync?.skipped) {
+    checks.push(createCheck(
+      'schedule-sync',
+      'warn',
+      scheduleSync.skipReason || 'Schedule drift check was skipped.',
+      'Pass `--workspace-root` explicitly if the workspace is installed in a non-default location.',
+    ));
+  } else if (scheduleSync && scheduleSync.workflowCount === 0) {
+    checks.push(createCheck('schedule-sync', 'ok', 'No workflows were found for schedule drift inspection.'));
+  } else if (scheduleSync?.fixAttempt?.errors?.length > 0) {
+    const errorSummary = scheduleSync.fixAttempt.errors
+      .map((entry) => `${entry.workflowId}: ${entry.error}`)
+      .join('; ');
+    checks.push(createCheck(
+      'schedule-sync',
+      'fail',
+      `Automatic schedule sync repair failed. ${errorSummary}`,
+      'Fix the reported workflow sync errors, then rerun `node scripts/doctor.js --fix`.',
+    ));
+  } else if (scheduleSync?.fixRequested && scheduleSync?.driftedWorkflows?.length === 0) {
+    const appliedCount = scheduleSync.fixAttempt?.applied?.length || 0;
+    if (appliedCount > 0) {
+      checks.push(createCheck('schedule-sync', 'ok', `Repaired OpenClaw cron drift for ${appliedCount} workflow(s).`));
+    } else {
+      checks.push(createCheck('schedule-sync', 'ok', 'OpenClaw cron is already in sync with workflow schedules.'));
+    }
+  } else if (scheduleSync?.driftedWorkflows?.length > 0) {
+    const workflowSummary = scheduleSync.driftedWorkflows
+      .map((inspection) => `${inspection.workflowId}: ${summarizeScheduleDrift(inspection.drift)}`)
+      .join(' | ');
+    checks.push(createCheck(
+      'schedule-sync',
+      'warn',
+      `OpenClaw cron drift detected in ${scheduleSync.driftedWorkflows.length} workflow(s). ${workflowSummary}`,
+      workspaceRoot
+        ? `Run \`node scripts/doctor.js --workspace-root "${workspaceRoot}" --fix\` or \`node scripts/sync-schedules.js --workspace-root "${workspaceRoot}"\`.`
+        : 'Run `node scripts/doctor.js --fix` or `node scripts/sync-schedules.js --workspace-root <path>`.',
+    ));
+  } else if (scheduleSync) {
+    checks.push(createCheck('schedule-sync', 'ok', 'OpenClaw cron is in sync with workflow schedules.'));
+  }
+
   return {
     status: getOverallStatus(checks),
     checks,
@@ -241,6 +484,7 @@ function formatDoctorReport(report, { skillRoot }) {
   const lines = [
     `Lobster Workflows Doctor: ${report.status.toUpperCase()}`,
     `Skill root: ${skillRoot}`,
+    ...(report.workspaceRoot ? [`Workspace root: ${report.workspaceRoot}`] : []),
     '',
   ];
 
@@ -255,8 +499,18 @@ function formatDoctorReport(report, { skillRoot }) {
   return lines.join('\n');
 }
 
-function runDoctor({ env = process.env, run = runCommand } = {}) {
-  const skillRoot = path.resolve(__dirname, '..');
+function runDoctor({
+  env = process.env,
+  run = runCommand,
+  skillRoot = path.resolve(__dirname, '..'),
+  workspaceRoot = null,
+  workflowId = null,
+  fix = false,
+  openclawCommand = env.LOBSTER_WORKFLOWS_OPENCLAW_BIN || 'openclaw',
+  openclawTimeoutMs = 30000,
+  inspectScheduleSyncFn = inspectScheduleSync,
+  applyScheduleSyncFixesFn = applyScheduleSyncFixes,
+} = {}) {
   const localPluginExists = fs.existsSync(path.join(skillRoot, 'plugin', 'index.js'));
 
   let pluginInfo = null;
@@ -284,8 +538,76 @@ function runDoctor({ env = process.env, run = runCommand } = {}) {
   }
 
   const configValidation = validateOpenClawConfig({ cwd: skillRoot, env, run });
+  const resolvedWorkspaceRoot = resolveWorkspaceRoot({
+    requestedWorkspaceRoot: workspaceRoot,
+    pluginInfo,
+    env,
+  });
+  let scheduleSync = null;
+  try {
+    scheduleSync = inspectScheduleSyncFn({
+      skillRoot,
+      workspaceRoot: resolvedWorkspaceRoot,
+      workflowId,
+      env,
+      run,
+      openclawCommand,
+      openclawTimeoutMs,
+    });
+
+    if (fix && !scheduleSync.skipped && !scheduleSync.error && Array.isArray(scheduleSync.driftedWorkflows) && scheduleSync.driftedWorkflows.length > 0) {
+      const fixAttempt = applyScheduleSyncFixesFn({
+        skillRoot,
+        workspaceRoot: scheduleSync.workspaceRoot,
+        workflowIds: scheduleSync.driftedWorkflows.map((inspection) => inspection.workflowId),
+        env,
+        run,
+        openclawCommand,
+        openclawTimeoutMs,
+      });
+      scheduleSync.fixRequested = true;
+      scheduleSync.fixAttempt = fixAttempt;
+      if (fixAttempt.errors.length === 0) {
+        scheduleSync = {
+          ...inspectScheduleSyncFn({
+            skillRoot,
+            workspaceRoot: resolvedWorkspaceRoot,
+            workflowId,
+            env,
+            run,
+            openclawCommand,
+            openclawTimeoutMs,
+          }),
+          fixRequested: true,
+          fixAttempt,
+        };
+      }
+    } else if (fix) {
+      scheduleSync = {
+        ...scheduleSync,
+        fixRequested: true,
+        fixAttempt: {
+          applied: [],
+          errors: [],
+        },
+      };
+    }
+  } catch (error) {
+    scheduleSync = {
+      skipped: false,
+      workspaceRoot: resolvedWorkspaceRoot,
+      workflowCount: 0,
+      inspections: [],
+      driftedWorkflows: [],
+      error: error.message || String(error),
+      fixRequested: fix,
+      fixAttempt: fix ? { applied: [], errors: [] } : null,
+    };
+  }
+
   const report = evaluateDoctorChecks({
     skillRoot,
+    workspaceRoot: scheduleSync?.workspaceRoot || resolvedWorkspaceRoot || null,
     localPluginExists,
     pluginInfo,
     pluginInfoError,
@@ -296,17 +618,30 @@ function runDoctor({ env = process.env, run = runCommand } = {}) {
     telegramBotToken: getTelegramBotToken(env),
     globalApprovers: resolveTelegramApprovers({ workflow: null, env }),
     configValidation,
+    scheduleSync,
   });
 
   return {
     skillRoot,
+    workspaceRoot: scheduleSync?.workspaceRoot || resolvedWorkspaceRoot || null,
     report,
+    scheduleSync,
   };
 }
 
-function main() {
-  const result = runDoctor();
-  console.log(formatDoctorReport(result.report, { skillRoot: result.skillRoot }));
+function main(argv = process.argv.slice(2)) {
+  const flags = parseArgs(argv);
+  const result = runDoctor({
+    workspaceRoot: flags.workspaceRoot || null,
+    workflowId: flags.workflow || null,
+    fix: Boolean(flags.fix),
+    openclawCommand: flags.openclawCommand || process.env.LOBSTER_WORKFLOWS_OPENCLAW_BIN || 'openclaw',
+    openclawTimeoutMs: flags.openclawTimeoutMs ? Number.parseInt(flags.openclawTimeoutMs, 10) : 30000,
+  });
+  console.log(formatDoctorReport({
+    ...result.report,
+    workspaceRoot: result.workspaceRoot,
+  }, { skillRoot: result.skillRoot }));
   if (result.report.status === 'fail') {
     process.exitCode = 1;
   }
@@ -323,11 +658,14 @@ if (require.main === module) {
 
 module.exports = {
   evaluateDoctorChecks,
+  applyScheduleSyncFixes,
   formatDoctorReport,
   getOverallStatus,
+  inspectScheduleSync,
   loadPluginInfo,
   loadPluginsAllow,
   normalizeComparablePath,
+  resolveWorkspaceRoot,
   runDoctor,
   validateOpenClawConfig,
 };

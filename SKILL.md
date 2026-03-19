@@ -57,6 +57,7 @@ node scripts/run-workflow.js --workspace-root <path> --workflow <workflow-id>
 node scripts/list-pending-approvals.js --workspace-root <path>
 node scripts/resume-workflow.js --workspace-root <path> --callback-data '/lwf ap:<token>'
 node scripts/sync-schedules.js --workspace-root <path> [--workflow <workflow-id>]
+node scripts/doctor.js --workspace-root <path> [--workflow <workflow-id>] [--fix]
 node scripts/rebuild-daily-summary.js --workspace-root <path> --date YYYY-MM-DD
 ```
 
@@ -82,6 +83,8 @@ node scripts/rebuild-daily-summary.js --workspace-root <path> --date YYYY-MM-DD
 - Keep `workflow.config.js` declarative
 - The workflow defines identity, runtime, schedules, result, and observability
 - The skill runtime writes run records and latest results; the workflow does not write `_executions` directly
+- Any task that creates, edits, enables, disables, or deletes a schedule in `workflow.config.js` must run `node scripts/sync-schedules.js --workspace-root <path> [--workflow <workflow-id>]` before completion
+- If schedule drift is suspected or the user asks for a health check, run `node scripts/doctor.js --workspace-root <path>` and use `--fix` when the user wants reconciliation applied automatically
 
 ## Workflow Creation Checklist
 
@@ -89,6 +92,7 @@ When building a real workflow after scaffolding:
 
 - replace the placeholder action with the requested phases
 - update `workflow.config.js` so `runtime.defaultAction` and `result.extractor` match the real workflow
+- if `schedules` changed in any way, rerun `sync-schedules.js` before finishing
 - write or adapt `README.md` and `CONTRACT.md`
 - add at least one smoke test plus targeted tests for fragile phases
 - prefer `_shared` helpers only when they are genuinely workflow-agnostic

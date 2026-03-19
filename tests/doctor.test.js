@@ -6,6 +6,7 @@ const {
   evaluateDoctorChecks,
   formatDoctorReport,
   getOverallStatus,
+  runDoctor,
 } = require('../scripts/doctor');
 
 test('doctor reports ok when plugin and Telegram prerequisites are in place', () => {
@@ -71,6 +72,49 @@ test('doctor reports warn for missing allowlist pinning and global approvers', (
   assert.equal(report.checks.some((check) => check.id === 'telegram-approvers' && check.status === 'warn'), true);
 });
 
+test('doctor reports warn when workflow schedules drift from OpenClaw cron', () => {
+  const skillRoot = path.join(process.cwd(), 'skill-root');
+  const report = evaluateDoctorChecks({
+    skillRoot,
+    workspaceRoot: path.join(process.cwd(), 'workspace'),
+    localPluginExists: true,
+    pluginInfo: {
+      enabled: true,
+      status: 'loaded',
+      commands: ['lwf'],
+      source: path.join(skillRoot, 'plugin', 'index.js'),
+    },
+    telegramPluginInfo: {
+      enabled: true,
+      status: 'loaded',
+    },
+    pluginsAllow: {
+      present: true,
+      values: ['lobster-workflows-telegram'],
+    },
+    telegramBotToken: 'telegram-bot-token',
+    globalApprovers: ['1234567890'],
+    configValidation: {
+      ok: true,
+    },
+    scheduleSync: {
+      skipped: false,
+      workspaceRoot: path.join(process.cwd(), 'workspace'),
+      workflowCount: 1,
+      driftedWorkflows: [{
+        workflowId: 'daily-report',
+        drift: [{
+          type: 'missing-active-job',
+          scheduleId: 'morning',
+        }],
+      }],
+    },
+  });
+
+  assert.equal(report.status, 'warn');
+  assert.equal(report.checks.some((check) => check.id === 'schedule-sync' && check.status === 'warn'), true);
+});
+
 test('doctor reports fail for missing plugin install and invalid config', () => {
   const skillRoot = path.join(process.cwd(), 'skill-root');
   const report = evaluateDoctorChecks({
@@ -99,6 +143,158 @@ test('doctor reports fail for missing plugin install and invalid config', () => 
   assert.equal(report.checks.some((check) => check.id === 'lobster-plugin-install' && check.status === 'fail'), true);
   assert.equal(report.checks.some((check) => check.id === 'telegram-channel-plugin' && check.status === 'fail'), true);
   assert.equal(report.checks.some((check) => check.id === 'openclaw-config' && check.status === 'fail'), true);
+});
+
+test('doctor reports ok after schedule drift is repaired with --fix', () => {
+  const skillRoot = path.resolve(__dirname, '..');
+  const inspectCalls = [];
+  const result = runDoctor({
+    skillRoot,
+    workspaceRoot: path.join(process.cwd(), 'workspace'),
+    fix: true,
+    env: {
+      TELEGRAM_BOT_TOKEN: 'telegram-bot-token',
+      OPENCLAW_TELEGRAM_APPROVERS: '1234567890',
+    },
+    run: (command, args) => {
+      if (args[0] === 'plugins' && args[1] === 'info' && args[2] === 'lobster-workflows-telegram') {
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            id: 'lobster-workflows-telegram',
+            enabled: true,
+            status: 'loaded',
+            commands: ['lwf'],
+            source: path.join(skillRoot, 'plugin', 'index.js'),
+            workspaceDir: path.join(process.cwd(), 'workspace'),
+          }),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'plugins' && args[1] === 'info' && args[2] === 'telegram') {
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            id: 'telegram',
+            enabled: true,
+            status: 'loaded',
+          }),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'config' && args[1] === 'get' && args[2] === 'plugins.allow') {
+        return {
+          ok: true,
+          stdout: JSON.stringify(['lobster-workflows-telegram']),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'config' && args[1] === 'validate') {
+        return {
+          ok: true,
+          stdout: '',
+          stderr: '',
+        };
+      }
+      throw new Error(`Unexpected command: ${command} ${args.join(' ')}`);
+    },
+    inspectScheduleSyncFn: () => {
+      inspectCalls.push('inspect');
+      if (inspectCalls.length === 1) {
+        return {
+          skipped: false,
+          workspaceRoot: path.join(process.cwd(), 'workspace'),
+          workflowCount: 1,
+          driftedWorkflows: [{
+            workflowId: 'daily-report',
+            drift: [{
+              type: 'missing-active-job',
+              scheduleId: 'morning',
+            }],
+          }],
+          inSync: false,
+        };
+      }
+      return {
+        skipped: false,
+        workspaceRoot: path.join(process.cwd(), 'workspace'),
+        workflowCount: 1,
+        driftedWorkflows: [],
+        inSync: true,
+      };
+    },
+    applyScheduleSyncFixesFn: () => ({
+      applied: [{
+        workflowId: 'daily-report',
+        operations: [{ type: 'add', scheduleId: 'morning', jobId: 'job-1' }],
+      }],
+      errors: [],
+    }),
+  });
+
+  assert.equal(result.report.status, 'ok');
+  assert.equal(result.report.checks.some((check) => check.id === 'schedule-sync' && check.status === 'ok'), true);
+  assert.equal(inspectCalls.length, 2);
+});
+
+test('doctor reports fail when schedule drift inspection cannot reach cron state', () => {
+  const skillRoot = path.resolve(__dirname, '..');
+  const result = runDoctor({
+    skillRoot,
+    workspaceRoot: path.join(process.cwd(), 'workspace'),
+    env: {
+      TELEGRAM_BOT_TOKEN: 'telegram-bot-token',
+      OPENCLAW_TELEGRAM_APPROVERS: '1234567890',
+    },
+    run: (command, args) => {
+      if (args[0] === 'plugins' && args[1] === 'info' && args[2] === 'lobster-workflows-telegram') {
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            id: 'lobster-workflows-telegram',
+            enabled: true,
+            status: 'loaded',
+            commands: ['lwf'],
+            source: path.join(skillRoot, 'plugin', 'index.js'),
+            workspaceDir: path.join(process.cwd(), 'workspace'),
+          }),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'plugins' && args[1] === 'info' && args[2] === 'telegram') {
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            id: 'telegram',
+            enabled: true,
+            status: 'loaded',
+          }),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'config' && args[1] === 'get' && args[2] === 'plugins.allow') {
+        return {
+          ok: true,
+          stdout: JSON.stringify(['lobster-workflows-telegram']),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'config' && args[1] === 'validate') {
+        return {
+          ok: true,
+          stdout: '',
+          stderr: '',
+        };
+      }
+      throw new Error(`Unexpected command: ${command} ${args.join(' ')}`);
+    },
+    inspectScheduleSyncFn: () => {
+      throw new Error('Failed to list cron jobs: gateway connect failed');
+    },
+  });
+
+  assert.equal(result.report.status, 'fail');
+  assert.equal(result.report.checks.some((check) => check.id === 'schedule-sync' && check.status === 'fail'), true);
 });
 
 test('doctor report formatter includes statuses and hints', () => {
