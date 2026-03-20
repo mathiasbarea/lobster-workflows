@@ -18,8 +18,9 @@ Normally, managing multiple workflows can become chaotic with fragmented scripts
 ### 📋 Requirements
 
 -  **Node.js:** Must be available on the system for script execution.
--  **OpenClaw:** Installed and configured with `lobster` and `llm-task` enabled.
+-  **OpenClaw:** Installed and configured.
 -  **Lobster:** Installed and available on `PATH`.
+-  **`llm-task` workflows:** If a workflow uses OpenClaw `llm-task`, the bundled `llm-task` plugin must be enabled, included in `plugins.allow` when that allowlist exists, and allowlisted for the agent that runs managed workflows.
 
 >  **[If you need help installing Lobster and adding it to OpenClaw, check this guide.](https://github.com/mathiasbarea/Agentic-Tools/blob/main/Lobster-How-To.md)**
 
@@ -33,12 +34,24 @@ Repository URL: https://github.com/mathiasbarea/lobster-workflows
 
 To install the Telegram Approval Plugin and verify the environment integrity, execute the following commands from within the lobster-workflows skill directory:
 
-```Bash
-`node scripts/install-telegram-plugin.`
-`node scripts/doctor.js`
+```bash
+node scripts/install-telegram-plugin.js
+node scripts/doctor.js
 ```
 
-Then, restart you OpenClaw Gateway.
+If your workflows use JSON-only LLM steps through OpenClaw `llm-task`, run this once as well:
+
+```bash
+node scripts/enable-llm-task.js
+```
+
+That helper makes the effective OpenClaw setup usable by:
+
+- enabling `plugins.entries.llm-task`
+- merging `llm-task` into `plugins.allow` when that allowlist already exists
+- merging `llm-task` into `agents.list[].tools.allow` for agent `main`
+
+Then, restart your OpenClaw Gateway.
 
 ⚠️ Ensure your Telegram integration is active within your OpenClaw instance. Additionally, your Telegram User ID must be explicitly authorized to process approvals.
 
@@ -93,6 +106,14 @@ This creates `workflows/`, `_shared/`, and `_executions/`. It is **idempotent**;
 node scripts/new-workflow.js --workspace-root /path/to/workspace --id my-workflow
 ```
 This creates a scaffold with a config, README, CONTRACT, Lobster file, Node runner, starter action, and smoke test.
+
+### 2.5. Enable `llm-task` for workflow-driven JSON steps
+
+```bash
+node scripts/enable-llm-task.js
+```
+
+Use this when a workflow calls OpenClaw `llm-task` directly or indirectly. `doctor.js` now enforces this for workflows that reference `llm-task`, and also warns when the optional readiness is still missing so future workflows do not fail unexpectedly.
 
 ### 3. Run a workflow manually
 

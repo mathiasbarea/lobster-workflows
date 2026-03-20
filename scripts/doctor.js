@@ -23,12 +23,19 @@ const { runCommand } = require('./lib/process-utils');
 const { syncSchedules } = require('./sync-schedules');
 const { listWorkflowIds, loadWorkflow } = require('./lib/workflow-loader');
 const {
+  DEFAULT_AGENT_ID,
+  LLM_TASK_PLUGIN_ID,
+  parseAgentsListJson,
+} = require('./enable-llm-task');
+const {
   PLUGIN_ID,
   isMissingConfigPath,
   parsePluginsAllowJson,
 } = require('./install-telegram-plugin');
 
 const STOCK_TELEGRAM_PLUGIN_ID = 'telegram';
+const LLM_TASK_SCAN_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.ts', '.lobster']);
+const LLM_TASK_SCAN_IGNORED_DIRECTORIES = new Set(['node_modules', 'tests', 'old', '_executions']);
 
 function createCheck(id, status, summary, hint = null) {
   return { id, status, summary, hint };
@@ -95,7 +102,32 @@ function loadPluginInfo(pluginId, { cwd, env, run = runCommand }) {
 }
 
 function loadPluginsAllow({ cwd, env, run = runCommand }) {
-  const result = run(env.LOBSTER_WORKFLOWS_OPENCLAW_BIN || 'openclaw', ['config', 'get', 'plugins.allow', '--json'], {
+  return loadStringArrayConfig('plugins.allow', { cwd, env, run });
+}
+
+function parseStringArrayJson(rawValue, configPath) {
+  const text = String(rawValue || '').trim();
+  if (!text) return [];
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Failed to parse ${configPath} as JSON: ${error.message}`);
+  }
+
+  if (parsed == null) return [];
+  if (!Array.isArray(parsed)) {
+    throw new Error(`Expected ${configPath} to be a JSON array.`);
+  }
+
+  return parsed
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+}
+
+function loadStringArrayConfig(configPath, { cwd, env, run = runCommand }) {
+  const result = run(env.LOBSTER_WORKFLOWS_OPENCLAW_BIN || 'openclaw', ['config', 'get', configPath, '--json'], {
     cwd,
     env,
     timeoutMs: 30000,
@@ -104,7 +136,9 @@ function loadPluginsAllow({ cwd, env, run = runCommand }) {
   if (result.ok) {
     return {
       present: true,
-      values: parsePluginsAllowJson(result.stdout),
+      values: configPath === 'plugins.allow'
+        ? parsePluginsAllowJson(result.stdout)
+        : parseStringArrayJson(result.stdout, configPath),
     };
   }
 
@@ -115,7 +149,109 @@ function loadPluginsAllow({ cwd, env, run = runCommand }) {
     };
   }
 
-  throw new Error(describeCommandFailure('Reading plugins.allow', result));
+  throw new Error(describeCommandFailure(`Reading ${configPath}`, result));
+}
+
+function loadAgentsList({ cwd, env, run = runCommand }) {
+  const result = run(env.LOBSTER_WORKFLOWS_OPENCLAW_BIN || 'openclaw', ['config', 'get', 'agents.list', '--json'], {
+    cwd,
+    env,
+    timeoutMs: 30000,
+  });
+
+  if (result.ok) {
+    return {
+      present: true,
+      values: parseAgentsListJson(result.stdout),
+    };
+  }
+
+  if (isMissingConfigPath(result)) {
+    return {
+      present: false,
+      values: [],
+    };
+  }
+
+  throw new Error(describeCommandFailure('Reading agents.list', result));
+}
+
+function pathContainsLlmTaskReference(targetPath) {
+  try {
+    const stat = fs.statSync(targetPath);
+    if (stat.isDirectory()) {
+      const entries = fs.readdirSync(targetPath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory() && LLM_TASK_SCAN_IGNORED_DIRECTORIES.has(entry.name)) continue;
+        if (pathContainsLlmTaskReference(path.join(targetPath, entry.name))) return true;
+      }
+      return false;
+    }
+
+    const extension = path.extname(targetPath).toLowerCase();
+    if (!LLM_TASK_SCAN_EXTENSIONS.has(extension)) return false;
+    const content = fs.readFileSync(targetPath, 'utf8');
+    return content.includes(LLM_TASK_PLUGIN_ID);
+  } catch {
+    return false;
+  }
+}
+
+function inspectLlmTaskUsage({
+  workspaceRoot,
+  workflowId = null,
+  listWorkflowIdsFn = listWorkflowIds,
+  loadWorkflowFn = loadWorkflow,
+}) {
+  if (!workspaceRoot) {
+    return {
+      skipped: true,
+      workflowIds: [],
+      required: false,
+      skipReason: 'Workspace root could not be resolved.',
+    };
+  }
+
+  const resolvedWorkspaceRoot = path.resolve(workspaceRoot);
+  if (!fs.existsSync(resolvedWorkspaceRoot)) {
+    return {
+      skipped: true,
+      workflowIds: [],
+      required: false,
+      skipReason: `Workspace root does not exist: ${resolvedWorkspaceRoot}`,
+    };
+  }
+
+  const targetWorkflowIds = workflowId ? [workflowId] : listWorkflowIdsFn(resolvedWorkspaceRoot);
+  const requiredWorkflowIds = targetWorkflowIds.filter((currentWorkflowId) => {
+    const workflow = loadWorkflowFn(resolvedWorkspaceRoot, currentWorkflowId);
+    return pathContainsLlmTaskReference(workflow.workflowRoot);
+  });
+
+  return {
+    skipped: false,
+    workflowIds: requiredWorkflowIds,
+    required: requiredWorkflowIds.length > 0,
+  };
+}
+
+function allowlistIncludesTool(values, toolName) {
+  const normalizedValues = (Array.isArray(values) ? values : [])
+    .map((value) => String(value || '').trim().toLowerCase())
+    .filter(Boolean);
+  const normalizedTool = String(toolName || '').trim().toLowerCase();
+  return normalizedValues.includes('*') ||
+    normalizedValues.includes('group:plugins') ||
+    normalizedValues.includes(normalizedTool);
+}
+
+function agentAllowsTool(agentsList, agentId, toolName) {
+  const normalizedAgentId = String(agentId || DEFAULT_AGENT_ID).trim();
+  const agent = (Array.isArray(agentsList) ? agentsList : [])
+    .find((entry) => String(entry?.id || '').trim() === normalizedAgentId);
+  if (!agent || !agent.tools || typeof agent.tools !== 'object') return false;
+  return allowlistIncludesTool(agent.tools.allow, toolName) ||
+    allowlistIncludesTool(agent.tools.alsoAllow, toolName);
 }
 
 function validateOpenClawConfig({ cwd, env, run = runCommand }) {
@@ -367,6 +503,7 @@ function evaluateDoctorChecks({
   configValidation,
   gatewayAccess = null,
   scheduleSync = null,
+  llmTask = null,
 }) {
   const checks = [];
   const expectedPluginSource = path.join(skillRoot, 'plugin', 'index.js');
@@ -491,6 +628,110 @@ function evaluateDoctorChecks({
     ));
   }
 
+  const llmTaskPluginLoaded = llmTask?.pluginInfo?.enabled === true && llmTask?.pluginInfo?.status === 'loaded';
+  const llmTaskPluginExcludedByAllowlist = llmTask && pluginsAllow?.present && !pluginsAllow?.values?.includes(LLM_TASK_PLUGIN_ID);
+
+  if (llmTask?.required || llmTask?.inspectError) {
+    const workflowLabel = llmTask.workflowIds.length === 1
+      ? `Workflow ${llmTask.workflowIds[0]}`
+      : `Workflows ${llmTask.workflowIds.join(', ')}`;
+
+    if (llmTask.inspectError) {
+      checks.push(createCheck(
+        'llm-task-usage',
+        'fail',
+        `Could not inspect llm-task usage. ${llmTask.inspectError}`,
+        'Fix the workspace inspection issue, then rerun the doctor.',
+      ));
+    } else if (llmTask.pluginInfoError) {
+      checks.push(createCheck(
+        'llm-task-plugin',
+        'fail',
+        `${workflowLabel} require ${LLM_TASK_PLUGIN_ID}, but OpenClaw could not inspect that plugin. ${llmTask.pluginInfoError}`,
+        'Run `node scripts/enable-llm-task.js` and restart the gateway.',
+      ));
+    } else {
+      if (llmTaskPluginLoaded) {
+        checks.push(createCheck('llm-task-plugin', 'ok', `${workflowLabel} require ${LLM_TASK_PLUGIN_ID}, and the plugin is active in OpenClaw.`));
+      } else if (llmTaskPluginExcludedByAllowlist || /not in allowlist/i.test(String(llmTask.pluginInfo?.error || ''))) {
+        checks.push(createCheck(
+          'llm-task-plugin',
+          'fail',
+          `${workflowLabel} require ${LLM_TASK_PLUGIN_ID}, but the plugin is excluded from plugins.allow.`,
+          'Run `node scripts/enable-llm-task.js` to merge it into plugins.allow, then restart the gateway.',
+        ));
+      } else {
+        checks.push(createCheck(
+          'llm-task-plugin',
+          'fail',
+          `${workflowLabel} require ${LLM_TASK_PLUGIN_ID}, but the plugin is not active in OpenClaw.`,
+          'Run `node scripts/enable-llm-task.js` and restart the gateway.',
+        ));
+      }
+    }
+
+    if (llmTask.toolPolicyError) {
+      checks.push(createCheck(
+        'llm-task-tool-policy',
+        'fail',
+        `Could not inspect the ${LLM_TASK_PLUGIN_ID} tool policy. ${llmTask.toolPolicyError}`,
+        'Fix the OpenClaw config access issue, then rerun the doctor.',
+      ));
+    } else if (llmTask.toolAllowed) {
+      checks.push(createCheck(
+        'llm-task-tool-policy',
+        'ok',
+        `${DEFAULT_AGENT_ID} can invoke ${LLM_TASK_PLUGIN_ID} through the current tool policy.`,
+      ));
+    } else {
+      checks.push(createCheck(
+        'llm-task-tool-policy',
+        'fail',
+        `${workflowLabel} require ${LLM_TASK_PLUGIN_ID}, but agent "${DEFAULT_AGENT_ID}" is not allowlisted to invoke it.`,
+        'Run `node scripts/enable-llm-task.js` to merge llm-task into agents.list[].tools.allow.',
+      ));
+    }
+  } else if (llmTask) {
+    if (llmTask.pluginInfoError || llmTask.toolPolicyError) {
+      const issues = [llmTask.pluginInfoError, llmTask.toolPolicyError]
+        .filter(Boolean)
+        .join(' ');
+      checks.push(createCheck(
+        'llm-task-readiness',
+        'warn',
+        `Optional ${LLM_TASK_PLUGIN_ID} readiness could not be fully inspected. ${issues}`,
+        'If you plan to add workflows that use llm-task, run `node scripts/enable-llm-task.js` and rerun the doctor.',
+      ));
+    } else {
+      const readinessIssues = [];
+      if (!llmTaskPluginLoaded) {
+        readinessIssues.push(
+          llmTaskPluginExcludedByAllowlist || /not in allowlist/i.test(String(llmTask.pluginInfo?.error || ''))
+            ? `${LLM_TASK_PLUGIN_ID} is excluded from plugins.allow`
+            : `${LLM_TASK_PLUGIN_ID} is not active in OpenClaw`,
+        );
+      }
+      if (!llmTask.toolAllowed) {
+        readinessIssues.push(`agent "${DEFAULT_AGENT_ID}" is not allowlisted to invoke ${LLM_TASK_PLUGIN_ID}`);
+      }
+
+      if (readinessIssues.length === 0) {
+        checks.push(createCheck(
+          'llm-task-readiness',
+          'ok',
+          `Optional ${LLM_TASK_PLUGIN_ID} readiness is already in place for agent "${DEFAULT_AGENT_ID}".`,
+        ));
+      } else {
+        checks.push(createCheck(
+          'llm-task-readiness',
+          'warn',
+          `Optional ${LLM_TASK_PLUGIN_ID} readiness is incomplete: ${readinessIssues.join('; ')}.`,
+          'If you plan to add workflows that use llm-task, run `node scripts/enable-llm-task.js` and restart the gateway.',
+        ));
+      }
+    }
+  }
+
   if (scheduleSync?.error) {
     const scheduleSyncHint = gatewayAccess?.gatewayStatus?.rpc?.ok === true
       ? 'Gateway transport is up, so verify cron-management access and auth/scopes from this CLI context before retrying.'
@@ -579,6 +820,7 @@ function runDoctor({
   openclawTimeoutMs = 30000,
   inspectScheduleSyncFn = inspectScheduleSync,
   applyScheduleSyncFixesFn = applyScheduleSyncFixes,
+  inspectLlmTaskUsageFn = inspectLlmTaskUsage,
 } = {}) {
   const localPluginExists = fs.existsSync(path.join(skillRoot, 'plugin', 'index.js'));
 
@@ -619,6 +861,47 @@ function runDoctor({
     pluginInfo,
     env,
   });
+  let llmTask = null;
+  try {
+    const llmTaskUsage = inspectLlmTaskUsageFn({
+      workspaceRoot: resolvedWorkspaceRoot,
+      workflowId,
+    });
+    llmTask = {
+      ...llmTaskUsage,
+      pluginInfo: null,
+      pluginInfoError: null,
+      toolPolicyError: null,
+      toolAllowed: false,
+    };
+    try {
+      llmTask.pluginInfo = loadPluginInfo(LLM_TASK_PLUGIN_ID, { cwd: skillRoot, env, run });
+    } catch (error) {
+      llmTask.pluginInfoError = error.message || String(error);
+    }
+
+    try {
+      const globalToolsAllow = loadStringArrayConfig('tools.allow', { cwd: skillRoot, env, run });
+      const globalToolsAlsoAllow = loadStringArrayConfig('tools.alsoAllow', { cwd: skillRoot, env, run });
+      const agentsList = loadAgentsList({ cwd: skillRoot, env, run });
+      llmTask.toolAllowed = allowlistIncludesTool(globalToolsAllow.values, LLM_TASK_PLUGIN_ID) ||
+        allowlistIncludesTool(globalToolsAlsoAllow.values, LLM_TASK_PLUGIN_ID) ||
+        agentAllowsTool(agentsList.values, DEFAULT_AGENT_ID, LLM_TASK_PLUGIN_ID);
+    } catch (error) {
+      llmTask.toolPolicyError = error.message || String(error);
+    }
+  } catch (error) {
+    llmTask = {
+      skipped: false,
+      required: false,
+      workflowIds: [],
+      inspectError: error.message || String(error),
+      pluginInfo: null,
+      pluginInfoError: null,
+      toolPolicyError: null,
+      toolAllowed: false,
+    };
+  }
   let scheduleSync = null;
   try {
     scheduleSync = inspectScheduleSyncFn({
@@ -696,6 +979,7 @@ function runDoctor({
     configValidation,
     gatewayAccess,
     scheduleSync,
+    llmTask,
   });
 
   return {
@@ -741,7 +1025,9 @@ module.exports = {
   getOverallStatus,
   inspectScheduleSync,
   loadPluginInfo,
+  inspectLlmTaskUsage,
   loadPluginsAllow,
+  loadStringArrayConfig,
   normalizeComparablePath,
   resolveWorkspaceRoot,
   runDoctor,

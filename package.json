@@ -7,6 +7,7 @@
   "scripts": {
     "bootstrap-workspace": "node scripts/bootstrap-workspace.js",
     "doctor": "node scripts/doctor.js",
+    "enable-llm-task": "node scripts/enable-llm-task.js",
     "install-telegram-plugin": "node scripts/install-telegram-plugin.js",
     "new-workflow": "node scripts/new-workflow.js",
     "run-workflow": "node scripts/run-workflow.js",

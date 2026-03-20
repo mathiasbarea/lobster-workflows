@@ -53,6 +53,7 @@ Use the bundled scripts directly:
 ```bash
 node scripts/bootstrap-workspace.js --workspace-root <path>
 node scripts/new-workflow.js --workspace-root <path> --id <workflow-id>
+node scripts/enable-llm-task.js
 node scripts/run-workflow.js --workspace-root <path> --workflow <workflow-id>
 node scripts/list-pending-approvals.js --workspace-root <path>
 node scripts/resume-workflow.js --workspace-root <path> --callback-data '/lwf ap:<token>'
@@ -89,7 +90,8 @@ node scripts/rebuild-daily-summary.js --workspace-root <path> --date YYYY-MM-DD
 - Treat the persisted sync file as attempt state, not just success state: it may explicitly be `synced`, `failed`, `partial`, or `recovery-only`
 - If schedule sync returns `status: "recovery-only"`, no cron mutation happened; use `recovery.retryCommands` or `operations[].remediation` instead of claiming the sync succeeded
 - If schedule sync fails operationally, inspect the emitted invocation, stdout/stderr, CLI resolution context, and recommendation before retrying manually
-- If schedule drift is suspected or the user asks for a health check, run `node scripts/doctor.js --workspace-root <path>` and use `--fix` when the user wants reconciliation applied automatically
+- Run `node scripts/doctor.js --workspace-root <path>` when validating a fresh workspace, after changing `openclaw.json`, plugins, `plugins.allow`, `agents.list`, or tool policy, after enabling optional integrations such as Telegram or `llm-task`, after restarting the gateway to confirm effective runtime state, before claiming a new workflow is runnable, or whenever schedule drift / runtime availability is in doubt. Use `--fix` when the user wants automatic schedule reconciliation
+- If a workflow uses OpenClaw `llm-task`, ensure onboarding is complete before claiming the workflow is runnable: the bundled `llm-task` plugin must be enabled, present in `plugins.allow` when that allowlist exists, and allowlisted for the executing agent. `doctor.js` should enforce this when a workflow already depends on `llm-task`, and still warn when optional readiness is missing. Prefer `node scripts/enable-llm-task.js` plus `node scripts/doctor.js --workspace-root <path>`.
 
 ## Workflow Creation Checklist
 
