@@ -1,3 +1,4 @@
+const fs = require('fs');
 const path = require('path');
 const { escapeForSingleQuotedJs, normalizePath } = require('./_lib');
 
@@ -240,6 +241,7 @@ module.exports = {
   resolveOpenClawAccess,
 };
 `,
+    'llm-task.js': fs.readFileSync(path.join(__dirname, '..', 'templates', 'shared', 'llm-task.js'), 'utf8'),
   };
 }
 

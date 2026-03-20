@@ -92,6 +92,7 @@ node scripts/rebuild-daily-summary.js --workspace-root <path> --date YYYY-MM-DD
 - If schedule sync fails operationally, inspect the emitted invocation, stdout/stderr, CLI resolution context, and recommendation before retrying manually
 - Run `node scripts/doctor.js --workspace-root <path>` when validating a fresh workspace, after changing `openclaw.json`, plugins, `plugins.allow`, `agents.list`, or tool policy, after enabling optional integrations such as Telegram or `llm-task`, after restarting the gateway to confirm effective runtime state, before claiming a new workflow is runnable, or whenever schedule drift / runtime availability is in doubt. Use `--fix` when the user wants automatic schedule reconciliation
 - If a workflow uses OpenClaw `llm-task`, ensure onboarding is complete before claiming the workflow is runnable: the bundled `llm-task` plugin must be enabled, present in `plugins.allow` when that allowlist exists, and allowlisted for the executing agent. `doctor.js` should enforce this when a workflow already depends on `llm-task`, and still warn when optional readiness is missing. Prefer `node scripts/enable-llm-task.js` plus `node scripts/doctor.js --workspace-root <path>`.
+- If a workflow uses structured OpenClaw `llm-task` output, prefer `workflows/_shared/llm-task.js` so the payload gets a schema-derived JSON contract before invocation. Do not hand-roll a fresh prompt wrapper for each workflow unless the shared helper is clearly insufficient.
 
 ## Workflow Creation Checklist
 

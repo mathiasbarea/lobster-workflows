@@ -44,6 +44,14 @@ Use for:
 - workflow code that needs to call OpenClaw tool endpoints
 - small integrations that are workflow-agnostic
 
+### `llm-task.js`
+
+Use for:
+
+- preparing `llm-task` payloads with a schema-derived JSON contract
+- invoking OpenClaw `llm-task` through a shared wrapper instead of ad hoc `invokeTool({ tool: 'llm-task' ... })`
+- keeping structured JSON-only workflow steps portable across workflows
+
 ### `artifact-checks.js`
 
 Use for:
