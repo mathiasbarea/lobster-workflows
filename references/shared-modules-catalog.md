@@ -52,6 +52,16 @@ Use for:
 - invoking OpenClaw `llm-task` through a shared wrapper instead of ad hoc `invokeTool({ tool: 'llm-task' ... })`
 - keeping structured JSON-only workflow steps portable across workflows
 
+### `agent-turn.js`
+
+Use for:
+
+- invoking `openclaw agent --agent <id> --local --json --message ...` from a workflow-agnostic wrapper
+- reusing stable `sessionId`, `thinking`, timeout, and extra CLI args across workflows
+- parsing the JSON response envelope and extracting text payloads without reimplementing the same glue in each workflow
+
+Keep workflow-specific prompt shaping, schema validation, retries, and business gating outside this helper.
+
 ### `artifact-checks.js`
 
 Use for:

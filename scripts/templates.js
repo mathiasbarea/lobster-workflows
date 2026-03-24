@@ -242,6 +242,7 @@ module.exports = {
 };
 `,
     'llm-task.js': fs.readFileSync(path.join(__dirname, '..', 'templates', 'shared', 'llm-task.js'), 'utf8'),
+    'agent-turn.js': fs.readFileSync(path.join(__dirname, '..', 'templates', 'shared', 'agent-turn.js'), 'utf8'),
   };
 }
 

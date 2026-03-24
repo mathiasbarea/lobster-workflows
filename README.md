@@ -21,6 +21,7 @@ Normally, managing multiple workflows can become chaotic with fragmented scripts
 -  **OpenClaw:** Installed and configured.
 -  **Lobster:** Installed and available on `PATH`.
 -  **`llm-task` workflows:** If a workflow uses OpenClaw `llm-task`, the bundled `llm-task` plugin must be enabled, included in `plugins.allow` when that allowlist exists, and allowlisted for the agent that runs managed workflows.
+-  **Agent-turn workflows:** If a workflow invokes full OpenClaw agent turns from a Node runner, each target agent must already exist in `agents.list`, have the required tool allowlist, and have access to the correct workspace or external systems.
 
 >  **[If you need help installing Lobster and adding it to OpenClaw, check this guide.](https://github.com/mathiasbarea/Agentic-Tools/blob/main/Lobster-How-To.md)**
 
@@ -115,6 +116,46 @@ node scripts/enable-llm-task.js
 
 Use this when a workflow calls OpenClaw `llm-task` directly or indirectly. `doctor.js` now enforces this for workflows that reference `llm-task`, and also warns when the optional readiness is still missing so future workflows do not fail unexpectedly.
 
+### 2.6. Use full OpenClaw agent turns when a step needs tools or side effects
+
+Use a full OpenClaw agent turn from a Node runner when a workflow step must:
+
+- browse or use real OpenClaw tools
+- write files or create code
+- operate inside a specific agent workspace
+- rely on agent-specific tool policy or auth context
+- do more than a single JSON-only classify, summarize, score, or draft step
+
+Typical implementation pattern:
+
+```bash
+openclaw agent --agent coding --local --json --message "..."
+```
+
+This skill now bootstraps `workflows/_shared/agent-turn.js`, which exports a reusable `runAgentTurn` helper for that CLI pattern.
+
+Example usage from a workflow Node runner:
+
+```js
+const { runAgentTurn } = require('../_shared/agent-turn');
+
+const { parsedPayload } = await runAgentTurn({
+  agentId: 'coding',
+  workspaceRoot,
+  message: 'Build the MVP in Node.js and return a JSON summary.',
+  sessionId: 'my-workflow-project-slug',
+  timeoutSeconds: 600,
+});
+```
+
+Important distinctions:
+
+- use `llm-task` for JSON-only LLM steps with no tool access
+- use a full agent turn for coding, browsing, filesystem writes, or multi-tool work
+- prefer `workflows/_shared/agent-turn.js` for the portable CLI wrapper, and keep only workflow-specific contracts or retries local
+- rerun `node scripts/bootstrap-workspace.js --workspace-root <path>` in existing workspaces to materialize the new helper if it is missing
+- after changing agent ids, tool allowlists, plugin readiness, or workspace assumptions, rerun `node scripts/doctor.js --workspace-root <path>` before claiming the workflow is runnable
+
 ### 3. Run a workflow manually
 
 ```Bash
@@ -172,7 +213,7 @@ This is where each workflow lives. Each managed workflow should contain:
 
 ### `workflows/_shared/`
 
-This is for **reusable code** that workflows can import directly. Examples include filesystem helpers, process helpers, OpenClaw client helpers, and envelope/error contracts. **Do not** put workflow-specific business logic here.
+This is for **reusable code** that workflows can import directly. Examples include filesystem helpers, process helpers, OpenClaw client helpers, `llm-task.js`, `agent-turn.js`, and envelope/error contracts. **Do not** put workflow-specific business logic here.
   
 ### `workflows/_executions/` 
 
@@ -224,6 +265,14 @@ When you run `scripts/run-workflow.js`, the skill executes these steps:
 7.  **Evaluates** success via `successCondition`.
 8.  **Extracts** result via `result.extractor`.
 9.  **Writes** the final record and updates `latestResult`.
+
+The managed runtime is agnostic about how the workflow implementation performs its internal work. A Node-based workflow may:
+
+- stay fully deterministic with plain code
+- call OpenClaw `llm-task` for JSON-only model steps
+- invoke full OpenClaw agent turns for phases that need tools or workspace side effects
+
+That means a managed workflow can still create code, browse, or modify files when its own Node runner explicitly launches a real agent turn and then validates the result.
 
 <br>
 

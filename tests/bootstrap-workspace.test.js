@@ -23,7 +23,7 @@ test('bootstrap-workspace creates the expected platform layout', () => {
     assert.equal(fs.existsSync(path.join(workflowsRoot, '_executions', dirName)), true);
   }
 
-  for (const fileName of ['README.md', 'contracts.js', 'fs-utils.js', 'openclaw-client.js', 'llm-task.js', 'process-runner.js', 'artifact-checks.js']) {
+  for (const fileName of ['README.md', 'contracts.js', 'fs-utils.js', 'openclaw-client.js', 'llm-task.js', 'agent-turn.js', 'process-runner.js', 'artifact-checks.js']) {
     assert.equal(fs.existsSync(path.join(workflowsRoot, '_shared', fileName)), true);
   }
 
